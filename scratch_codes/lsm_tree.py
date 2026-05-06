@@ -38,10 +38,12 @@ class PersistentLSM:
         self.index = [] 
         self.filters = {}      # Maps filename -> BloomFilter object
         self.generation = 0
-        self.wal_path = os.path.join(self.data_dir, "wal.log")
-
+        
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
+
+        self.wal_path = os.path.join(self.data_dir, "wal.log")
+        self.wal_handle = open(self.wal_path, 'a') # Keep it open for performance
 
         # RECOVERY: Rebuild state from disk
         self._recover()
@@ -81,8 +83,9 @@ class PersistentLSM:
 
     def _write_to_wal(self, key, data):
         """Appends a single operation to the Write-Ahead Log."""
-        with open(self.wal_path, 'a') as f:
-            f.write(json.dumps({'key': key, 'data': data}) + "\n")
+        self.wal_handle.write(json.dumps({'key': key, 'data': data}) + "\n")
+        self.wal_handle.flush() # Ensure OS writes it to disk immediately
+        os.fsync(self.wal_handle.fileno()) # The 'Gold Standard' for durability
 
     def put(self, key, value):
         entry = {'val': value, 'ts': time.time(), 'del': False}
@@ -119,6 +122,12 @@ class PersistentLSM:
         # Clear WAL after successful flush
         if os.path.exists(self.wal_path):
             os.remove(self.wal_path)
+
+        # 2. SUCCESS! Now we can safely clear the WAL.
+        # Instead of deleting, we truncate the file to 0 bytes.
+        self.wal_handle.truncate(0)
+        self.wal_handle.seek(0)
+        
         print(f"--- Flushed {fname} and cleared WAL ---")
 
     def get(self, key):
@@ -146,7 +155,3 @@ if __name__ == "__main__":
         rand_key = f"{random.randint(1, 100000)}_key"
         rand_val = f"{random.randint(1, 100000)}_val"
         db.put(rand_key, rand_val)   
-    
-    # Normally we would stop here. If you run the script again, 
-    # the code below will show that 'session_1' was recovered from the WAL.
-    print(f"Check session_1: {db.get('session_1')}")
