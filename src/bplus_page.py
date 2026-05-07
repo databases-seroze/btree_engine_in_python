@@ -181,6 +181,21 @@ class LeafPage:
         entries.sort(key=lambda x: x[0])
         self._rebuild(entries)
 
+    def delete_key(self, key: int) -> bool:
+        """
+        Remove key from this leaf.
+
+        Returns True if the key existed and was removed, False if it was
+        not present.  The underlying SlottedPage is rebuilt without the
+        deleted entry.
+        """
+        entries     = self._entries()
+        new_entries = [(k, v) for k, v in entries if k != key]
+        if len(new_entries) == len(entries):
+            return False   # key not found
+        self._rebuild(new_entries)
+        return True
+
     def split(self, right: 'LeafPage') -> int:
         """
         Split this leaf into two halves.
