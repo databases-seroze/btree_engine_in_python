@@ -2,16 +2,16 @@
 
 ## Milestones
 
-### Phase 1 — Core (in progress)
+### Phase 1 — Core ✅
 - [x] SlottedPage — fixed-size page with slot directory, insert/read/delete/compact
 - [x] Record encoding — variable-length rows with INT, STRING, NULL types
 - [x] B+Tree — LeafPage (SlottedPage-backed), IndexPage, search/insert/range_scan
 - [x] File-backed pager — 4096-byte pages, meta page, flush/close, reopen
-- [ ] **Delete** — remove a key from the tree; handle underflow via borrow or merge
-- [x] Engine API (`engine.py`) — put/get/delete/scan over encoded rows; context manager; file-backed
-- [x] Cursor — stateful iterator; next() via leaf linked list O(1); prev() re-walks range O(k); reset()
+- [x] Delete — borrow-right, borrow-left, merge, root collapse; full underflow propagation
+- [x] Engine API (`engine.py`) — put/get/delete/scan; context manager; in-memory + file-backed
+- [x] Cursor — next() O(1) via leaf links; prev() O(k) re-walk; reset(); for-loop iterator
 
-### Phase 2 — Durability
+### Phase 2 — Durability (in progress)
 - [ ] Buffer pool — LRU eviction, dirty-page tracking, pin/unpin
 - [ ] WAL (Write-Ahead Log) — log before write, replay on crash for consistency
 
