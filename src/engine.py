@@ -45,6 +45,7 @@ order : int
 
 from src.bplus_pager import BPlusPager
 from src.bplus_tree  import BPlusTree
+from src.cursor      import Cursor
 from src.record      import encode_record, decode_record
 
 
@@ -105,7 +106,6 @@ class Engine:
         start : int  lower bound (inclusive), default 0
         end   : int  upper bound (inclusive), default 2^32-1
         """
-        from src.cursor import Cursor
         return Cursor(self._tree, start, end)
 
     # ------------------------------------------------------------------
