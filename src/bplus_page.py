@@ -1,6 +1,8 @@
 """
 B+Tree page types.
 
+Every page is exactly PAGE_SIZE (4096) bytes on disk.
+
 LeafPage  — wraps a SlottedPage, stores sorted (key, record) cells,
             has a next_page_id pointer for the leaf linked list.
 
@@ -9,22 +11,48 @@ IndexPage — stores (keys[], children[]) for internal tree routing.
 
 Both accept a max_keys parameter so tests can force splits at small sizes
 without needing to fill 4 KB pages.
+
+On-disk formats
+---------------
+LeafPage (4096 bytes total):
+
+  Byte 0        : page_type = PageType.LEAF.value  (1)
+  Bytes 1-4     : next_page_id  (uint32LE, NO_NEXT = 0xFFFFFFFF means no sibling)
+  Bytes 5-4095  : SlottedPage body  (LEAF_BODY_SIZE = 4091 bytes)
+
+IndexPage (4096 bytes total):
+
+  Byte 0        : page_type = PageType.INDEX.value  (0)
+  Bytes 1-4     : num_keys  (uint32LE)
+  Bytes 5 …     : keys[0..n-1]        (n × uint32LE)
+  …             : children[0..n]      ((n+1) × uint32LE)
 """
 
 import struct
 from enum import Enum
 
-from src.slotted_page import SlottedPage
+from src.slotted_page import SlottedPage, PAGE_SIZE
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 class PageType(Enum):
     INDEX = 0
     LEAF  = 1
 
 
-# Every leaf cell on a SlottedPage is:  [key: 4B uint32][record bytes...]
+# Each leaf cell on a SlottedPage is: [key: 4B uint32][record bytes...]
 _KEY_FMT  = '<I'
 _KEY_SIZE = 4
+
+# LeafPage on-disk header occupies the first 5 bytes of the 4096-byte page.
+LEAF_HEADER_SIZE = 5                          # type(1) + next_page_id(4)
+LEAF_BODY_SIZE   = PAGE_SIZE - LEAF_HEADER_SIZE  # 4091 bytes for SlottedPage
+
+# Sentinel stored in next_page_id when there is no right sibling.
+NO_NEXT = 0xFFFF_FFFF
 
 
 # ---------------------------------------------------------------------------
@@ -38,15 +66,59 @@ class LeafPage:
     Wraps a SlottedPage whose cells are sorted by key.  The page_type is
     always PageType.LEAF.  next_page_id links adjacent leaves so range
     scans never need to go back up through index pages.
+
+    On-disk, the first 5 bytes are the B+Tree leaf header (type + next_page_id)
+    and the remaining 4091 bytes are the SlottedPage body (LEAF_BODY_SIZE).
     """
 
     page_type = PageType.LEAF
 
     def __init__(self, page_id: int, max_keys: int = 200):
         self.page_id      = page_id
-        self.next_page_id = None          # page_id of right sibling, or None
+        self.next_page_id = None             # page_id of right sibling, or None
         self.max_keys     = max_keys
-        self._page        = SlottedPage()
+        self._page        = SlottedPage(size=LEAF_BODY_SIZE)
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def to_bytes(self) -> bytes:
+        """
+        Serialise this leaf page to exactly PAGE_SIZE (4096) bytes.
+
+        Layout:
+            [0]     page_type  (1 byte)
+            [1:5]   next_page_id  (uint32LE; NO_NEXT when there is no sibling)
+            [5:]    SlottedPage body  (LEAF_BODY_SIZE = 4091 bytes)
+        """
+        buf = bytearray(PAGE_SIZE)
+        buf[0] = PageType.LEAF.value
+        nxt    = NO_NEXT if self.next_page_id is None else self.next_page_id
+        struct.pack_into('<I', buf, 1, nxt)
+        buf[LEAF_HEADER_SIZE:] = self._page.data   # exactly LEAF_BODY_SIZE bytes
+        return bytes(buf)
+
+    @classmethod
+    def from_bytes(cls, page_id: int, data: bytes | bytearray,
+                   max_keys: int = 200) -> 'LeafPage':
+        """
+        Deserialise a LeafPage from a PAGE_SIZE byte buffer.
+
+        Parameters
+        ----------
+        page_id  : int   — the page's logical ID (position in the file)
+        data     : bytes — PAGE_SIZE bytes read from disk
+        max_keys : int   — split threshold (must match the tree's order)
+        """
+        leaf = cls(page_id, max_keys)
+        nxt  = struct.unpack_from('<I', data, 1)[0]
+        leaf.next_page_id = None if nxt == NO_NEXT else nxt
+        # Overwrite the fresh SlottedPage's data with the serialised body.
+        # The body encodes its own header (free_start, free_end, num_slots),
+        # so the SlottedPage is fully restored by this assignment.
+        leaf._page.data[:] = data[LEAF_HEADER_SIZE : LEAF_HEADER_SIZE + LEAF_BODY_SIZE]
+        return leaf
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -65,8 +137,8 @@ class LeafPage:
         return result
 
     def _rebuild(self, entries: list):
-        """Replace the underlying SlottedPage with exactly these entries."""
-        self._page = SlottedPage()
+        """Replace the underlying SlottedPage with exactly these entries (must be sorted)."""
+        self._page = SlottedPage(size=LEAF_BODY_SIZE)
         for key, record in entries:
             cell = struct.pack(_KEY_FMT, key) + record
             self._page.insert(cell)
@@ -87,7 +159,7 @@ class LeafPage:
         entries = self._entries()
         lo, hi  = 0, len(entries) - 1
         while lo <= hi:
-            mid   = (lo + hi) // 2
+            mid       = (lo + hi) // 2
             k, record = entries[mid]
             if k == key:
                 return record
@@ -102,7 +174,7 @@ class LeafPage:
         entries = self._entries()
         for i, (k, _) in enumerate(entries):
             if k == key:
-                entries[i] = (key, record)   # update in place
+                entries[i] = (key, record)
                 self._rebuild(entries)
                 return
         entries.append((key, record))
@@ -119,22 +191,18 @@ class LeafPage:
         Leaf links are updated:  self → right → old self.next
 
         Returns the split_key (first key of right), which is *copied* up
-        to the parent index page.
+        to the parent index page (B+Tree copy-up rule).
         """
         entries = self._entries()
         mid     = len(entries) // 2
 
-        left_entries  = entries[:mid]
-        right_entries = entries[mid:]
+        self._rebuild(entries[:mid])
+        right._rebuild(entries[mid:])
 
-        self._rebuild(left_entries)
-        right._rebuild(right_entries)
-
-        # stitch the linked list
         right.next_page_id = self.next_page_id
         self.next_page_id  = right.page_id
 
-        return right_entries[0][0]   # split_key copied up
+        return entries[mid][0]   # split_key copied up
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +219,10 @@ class IndexPage:
         key < keys[0]              → children[0]
         keys[i-1] <= key < keys[i] → children[i]
         key >= keys[-1]            → children[-1]
+
+    On-disk, the full keys and children lists are packed as uint32LE arrays
+    right after a 5-byte header.  The total size is always PAGE_SIZE (4096)
+    bytes regardless of how many keys are stored; unused bytes are zeros.
     """
 
     page_type = PageType.INDEX
@@ -160,6 +232,58 @@ class IndexPage:
         self.max_keys = max_keys
         self.keys:     list[int] = []
         self.children: list[int] = []   # page_ids; len == len(keys) + 1
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def to_bytes(self) -> bytes:
+        """
+        Serialise this index page to exactly PAGE_SIZE (4096) bytes.
+
+        Layout:
+            [0]      page_type  (1 byte)
+            [1:5]    num_keys   (uint32LE)
+            [5 …]    keys[0..n-1]      (n × uint32LE)
+            [… ]     children[0..n]    ((n+1) × uint32LE)
+            rest     zeros
+        """
+        buf    = bytearray(PAGE_SIZE)
+        n      = len(self.keys)
+        buf[0] = PageType.INDEX.value
+        struct.pack_into('<I', buf, 1, n)
+        offset = 5
+        for k in self.keys:
+            struct.pack_into('<I', buf, offset, k)
+            offset += 4
+        for c in self.children:
+            struct.pack_into('<I', buf, offset, c)
+            offset += 4
+        return bytes(buf)
+
+    @classmethod
+    def from_bytes(cls, page_id: int, data: bytes | bytearray,
+                   max_keys: int = 4) -> 'IndexPage':
+        """
+        Deserialise an IndexPage from a PAGE_SIZE byte buffer.
+
+        Parameters
+        ----------
+        page_id  : int   — the page's logical ID
+        data     : bytes — PAGE_SIZE bytes read from disk
+        max_keys : int   — split threshold (must match the tree's order)
+        """
+        page = cls(page_id, max_keys)
+        n    = struct.unpack_from('<I', data, 1)[0]
+        if n > 0:
+            offset       = 5
+            page.keys    = list(struct.unpack_from(f'<{n}I',   data, offset))
+            offset      += n * 4
+            page.children = list(struct.unpack_from(f'<{n+1}I', data, offset))
+        else:
+            page.keys     = []
+            page.children = []
+        return page
 
     # ------------------------------------------------------------------
     # Public API
@@ -194,15 +318,15 @@ class IndexPage:
         Split this index page into two halves.
 
         The middle key is *pushed* up to the parent (not copied — it does
-        not remain in either child).
+        not remain in either child after the split).
 
-        Left half (self)  keeps keys[:mid]    and children[:mid+1].
-        Right half (right) gets keys[mid+1:]  and children[mid+1:].
+        Left half (self)   keeps keys[:mid]    and children[:mid+1].
+        Right half (right) gets  keys[mid+1:]  and children[mid+1:].
 
         Returns push_up_key (the key to insert into the parent).
         """
-        mid          = len(self.keys) // 2
-        push_up_key  = self.keys[mid]
+        mid         = len(self.keys) // 2
+        push_up_key = self.keys[mid]
 
         right.keys     = self.keys[mid + 1:]
         right.children = self.children[mid + 1:]

@@ -6,18 +6,39 @@ Public API
     tree.insert(key, record)           insert / update a key
     tree.search(key)                   return record bytes or None
     tree.range_scan(start, end)        return [(key, record), ...] inclusive
+    tree.flush()                       persist all cached pages to disk
+    tree.close()                       flush and close the underlying file
+
+Typical usage
+-------------
+Create a new on-disk tree:
+
+    from src.bplus_pager import BPlusPager
+    from src.bplus_tree  import BPlusTree
+
+    pager = BPlusPager("users.db", order=100)
+    tree  = BPlusTree(pager)
+    tree.insert(1, encode_record(["alice", 30]))
+    tree.flush()
+    pager.close()
+
+Reopen an existing tree:
+
+    pager = BPlusPager("users.db")   # order is restored from file
+    tree  = BPlusTree(pager)
+    print(tree.search(1))            # b'...'
 
 Design notes
 ------------
 * Keys are unsigned 32-bit integers.
 * Values are arbitrary bytes (use record.py to encode / decode rows).
-* `order` controls the max keys per node; after an insert pushes a node over
-  this limit the node is split immediately.  With order=4 every node holds
-  at most 4 keys between splits — small enough to exercise the full split /
-  propagation path in unit tests.
-* Leaf splits COPY the middle key up (it stays in the right leaf).
-* Index splits PUSH the middle key up (it leaves both children).
-* When the root splits a new root IndexPage is created automatically.
+* `order` controls the max keys per node; after an insert pushes a node
+  over this limit the node is split immediately.
+* Leaf splits COPY the middle key up (it stays as the first entry of the
+  right leaf — required for correct routing).
+* Index splits PUSH the middle key up (it leaves both child nodes).
+* When the root splits, a new root IndexPage is created automatically and
+  pager.root_page_id is updated so the file tracks the new root.
 """
 
 from src.bplus_page  import LeafPage, IndexPage
@@ -25,23 +46,36 @@ from src.bplus_pager import BPlusPager
 
 
 class BPlusTree:
+    """
+    B+Tree backed by a BPlusPager.
+
+    Parameters
+    ----------
+    pager : BPlusPager, optional
+        Supply your own pager (file-backed or in-memory).  If omitted an
+        in-memory pager is created automatically.
+    order : int
+        Max keys per node.  Only used when *creating* a new in-memory pager
+        (i.e. when pager=None).  When a pager is supplied, its own stored
+        order takes precedence so that reopening a file always uses the
+        same split threshold as when the file was created.
+    """
 
     def __init__(self, pager: BPlusPager | None = None, order: int = 4):
-        """
-        Parameters
-        ----------
-        pager : BPlusPager, optional
-            Supply your own pager (useful for testing).  If omitted a fresh
-            in-memory pager is created automatically.
-        order : int
-            Max keys per node before a split is triggered.
-        """
-        self._pager  = pager if pager is not None else BPlusPager()
-        self._order  = order
+        if pager is None:
+            pager = BPlusPager(order=order)
+        self._pager = pager
+        # Always use the pager's order (important for file-backed reopens).
+        self._order = pager._order
 
-        # Start with a single empty leaf as the root.
-        root = self._pager.new_leaf_page(max_keys=order)
-        self._root_id = root.page_id
+        if pager.root_page_id is not None:
+            # Reopening an existing tree — root is already known.
+            self._root_id = pager.root_page_id
+        else:
+            # Brand-new tree — create the first (empty) leaf as root.
+            root = pager.new_leaf_page()
+            self._root_id          = root.page_id
+            pager.root_page_id     = self._root_id
 
     # ------------------------------------------------------------------
     # Public API
@@ -56,12 +90,13 @@ class BPlusTree:
         """Insert or update key → record.  Splits nodes as needed."""
         result = self._insert(self._root_id, key, record)
         if result is not None:
-            # The root was split — create a new root above both halves.
+            # Root was split — promote a new root above both halves.
             push_up_key, new_page_id = result
-            new_root = self._pager.new_index_page(max_keys=self._order)
-            new_root.keys     = [push_up_key]
-            new_root.children = [self._root_id, new_page_id]
-            self._root_id = new_root.page_id
+            new_root           = self._pager.new_index_page()
+            new_root.keys      = [push_up_key]
+            new_root.children  = [self._root_id, new_page_id]
+            self._root_id      = new_root.page_id
+            self._pager.root_page_id = self._root_id   # keep pager in sync
 
     def range_scan(self, start_key: int, end_key: int) -> list:
         """
@@ -84,6 +119,14 @@ class BPlusTree:
             leaf = self._pager.get_page(leaf.next_page_id)
 
         return results
+
+    def flush(self):
+        """Write all cached pages and the meta page to disk (no-op for in-memory pager)."""
+        self._pager.flush()
+
+    def close(self):
+        """Flush and close the underlying file."""
+        self._pager.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -113,10 +156,10 @@ class BPlusTree:
             if not page.is_full():
                 return None
 
-            # Leaf is over capacity — split it.
-            right = self._pager.new_leaf_page(max_keys=self._order)
-            split_key = page.split(right)        # left stays in page
-            return (split_key, right.page_id)    # split_key copied up
+            # Leaf exceeded capacity — split it.
+            right     = self._pager.new_leaf_page()
+            split_key = page.split(right)       # left stays in page
+            return (split_key, right.page_id)   # split_key copied up
 
         # ---- Index node -----------------------------------------------
         child_id = page.find_child(key)
@@ -132,7 +175,7 @@ class BPlusTree:
         if not page.is_full():
             return None
 
-        # Index page is also over capacity — split it.
-        right_index  = self._pager.new_index_page(max_keys=self._order)
-        push_up_key  = page.split(right_index)   # middle key pushed up
+        # Index page also exceeded capacity — split it.
+        right_index = self._pager.new_index_page()
+        push_up_key = page.split(right_index)   # middle key pushed up
         return (push_up_key, right_index.page_id)
