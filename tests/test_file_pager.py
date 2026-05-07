@@ -194,6 +194,7 @@ def test_pager_reads_leaf_page_from_disk(tmp_path):
     pager = fresh_pager(tmp_path)
     leaf  = pager.new_leaf_page()
     leaf.insert(99, b"hello")
+    pager.mark_dirty(leaf)
     pager.flush()
     pager.close()
 
@@ -210,6 +211,7 @@ def test_pager_reads_index_page_from_disk(tmp_path):
     idx   = pager.new_index_page()
     idx.keys     = [5, 10]
     idx.children = [0, 1, 2]
+    pager.mark_dirty(idx)
     pager.flush()
     pager.close()
 

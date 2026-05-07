@@ -95,6 +95,7 @@ class BPlusTree:
             new_root           = self._pager.new_index_page()
             new_root.keys      = [push_up_key]
             new_root.children  = [self._root_id, new_page_id]
+            self._pager.mark_dirty(new_root)
             self._root_id      = new_root.page_id
             self._pager.root_page_id = self._root_id   # keep pager in sync
 
@@ -160,6 +161,7 @@ class BPlusTree:
         if not leaf.delete_key(key):
             return False
 
+        self._pager.mark_dirty(leaf)
         self._fix_underflow(path)
         return True
 
@@ -288,6 +290,9 @@ class BPlusTree:
             parent.keys[child_idx] = right.keys[0]
             right.keys.pop(0)
             right.children.pop(0)
+        self._pager.mark_dirty(page)
+        self._pager.mark_dirty(right)
+        self._pager.mark_dirty(parent)
 
     def _borrow_from_left(self, page, left, child_idx: int, parent,
                           is_leaf: bool):
@@ -312,6 +317,9 @@ class BPlusTree:
             parent.keys[child_idx - 1] = left.keys[-1]
             left.keys.pop(-1)
             left.children.pop(-1)
+        self._pager.mark_dirty(page)
+        self._pager.mark_dirty(left)
+        self._pager.mark_dirty(parent)
 
     def _merge_pages(self, left, right, sep_idx: int, parent,
                      is_leaf: bool):
@@ -335,6 +343,8 @@ class BPlusTree:
 
         parent.keys.pop(sep_idx)
         parent.children.pop(sep_idx + 1)
+        self._pager.mark_dirty(left)
+        self._pager.mark_dirty(parent)
 
     def flush(self):
         """Write all cached pages and the meta page to disk (no-op for in-memory pager)."""
@@ -368,6 +378,7 @@ class BPlusTree:
         # ---- Leaf node ------------------------------------------------
         if isinstance(page, LeafPage):
             page.insert(key, record)
+            self._pager.mark_dirty(page)
 
             if not page.is_full():
                 return None
@@ -375,6 +386,7 @@ class BPlusTree:
             # Leaf exceeded capacity — split it.
             right     = self._pager.new_leaf_page()
             split_key = page.split(right)       # left stays in page
+            self._pager.mark_dirty(right)
             return (split_key, right.page_id)   # split_key copied up
 
         # ---- Index node -----------------------------------------------
@@ -387,6 +399,7 @@ class BPlusTree:
         # A child split — absorb the new key into this index page.
         split_key, new_child_id = result
         page.insert_key(split_key, new_child_id)
+        self._pager.mark_dirty(page)
 
         if not page.is_full():
             return None
@@ -394,4 +407,5 @@ class BPlusTree:
         # Index page also exceeded capacity — split it.
         right_index = self._pager.new_index_page()
         push_up_key = page.split(right_index)   # middle key pushed up
+        self._pager.mark_dirty(right_index)
         return (push_up_key, right_index.page_id)

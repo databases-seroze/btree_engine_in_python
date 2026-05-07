@@ -4,8 +4,8 @@ BPlusPager — page allocator for the B+Tree.
 Two modes
 ---------
 In-memory  (default):  BPlusPager()
-    Pages live in a dict.  Nothing is written to disk.  Useful for unit
-    tests and throwaway trees.
+    Pages live in the buffer pool only.  Nothing is written to disk.
+    Useful for unit tests and throwaway trees.
 
 File-backed:           BPlusPager("mydb.db")
     Pages are persisted to a binary file.  The file begins with a 4096-byte
@@ -21,22 +21,20 @@ File-backed:           BPlusPager("mydb.db")
 
 Cache / write policy
 --------------------
-Pages are cached in memory after first access.  New pages are written to
-disk immediately (write-through for allocation).  Modified pages (splits,
-inserts) are NOT written automatically — call flush() or close() to
-persist all dirty state to disk.
-
-This is intentional: the B+Tree does multiple writes per insert (leaf
-rebuild, possible index update) and writing on every tiny change would be
-very slow.  flush() should be called after a batch of inserts, or on clean
-shutdown.
+Pages are managed through a BufferPool (LRU, configurable capacity).
+New pages are written to disk immediately (write-through for allocation).
+Modified pages are marked dirty and are NOT written automatically — call
+flush() or close() to persist all dirty state to disk.  During normal
+operation the buffer pool may also write dirty pages to disk eagerly when
+it needs to evict a frame.
 """
 
 import os
 import struct
 from typing import IO
 
-from src.bplus_page import LeafPage, IndexPage, PageType, PAGE_SIZE
+from src.bplus_page  import LeafPage, IndexPage, PageType, PAGE_SIZE
+from src.buffer_pool import BufferPool
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +68,17 @@ class BPlusPager:
         Maximum number of keys per node before a split is triggered.
         Stored in the meta page so it is automatically restored when the
         file is reopened (you do not need to remember it).
+    pool_capacity : int
+        Maximum number of pages to keep in the buffer pool at once.
+        Defaults to 256.  Ignored for in-memory pagers (the pool is still
+        used but eviction only matters for file-backed operation).
     """
 
-    def __init__(self, filepath: str | None = None, order: int = 4):
+    def __init__(self, filepath: str | None = None, order: int = 4,
+                 pool_capacity: int = 256):
         self._filepath  = filepath
         self._order     = order
-        self._cache:    dict[int, LeafPage | IndexPage] = {}
+        self._pool      = BufferPool(capacity=pool_capacity)
         self._next_id:  int = 0
         self.root_page_id: int | None = None
         self._file:     IO[bytes] | None = None
@@ -152,18 +155,18 @@ class BPlusPager:
     # ------------------------------------------------------------------
 
     def new_leaf_page(self) -> LeafPage:
-        """Allocate a new leaf page, add it to the cache, and write it to disk."""
+        """Allocate a new leaf page, add it to the pool, and write it to disk."""
         page = LeafPage(self._next_id, max_keys=self._order)
-        self._cache[self._next_id] = page
+        self._pool_put(page, dirty=False)   # new page written to disk below
         self._next_id += 1
         if self._file is not None:
             self._write_page_to_disk(page)
         return page
 
     def new_index_page(self) -> IndexPage:
-        """Allocate a new index page, add it to the cache, and write it to disk."""
+        """Allocate a new index page, add it to the pool, and write it to disk."""
         page = IndexPage(self._next_id, max_keys=self._order)
-        self._cache[self._next_id] = page
+        self._pool_put(page, dirty=False)
         self._next_id += 1
         if self._file is not None:
             self._write_page_to_disk(page)
@@ -177,19 +180,20 @@ class BPlusPager:
         """
         Return the page with the given ID.
 
-        Checks the in-memory cache first.  On a cache miss, reads from disk
-        (file-backed mode only) and populates the cache.
+        Checks the buffer pool first.  On a miss, reads from disk
+        (file-backed mode only) and inserts the page into the pool.
 
         Raises
         ------
         KeyError  — in-memory mode, page_id was never allocated.
         IOError   — file-backed mode, read failed.
         """
-        if page_id in self._cache:
-            return self._cache[page_id]
+        page = self._pool.get(page_id)
+        if page is not None:
+            return page
         if self._file is not None:
             page = self._read_page_from_disk(page_id)
-            self._cache[page_id] = page
+            self._pool_put(page, dirty=False)
             return page
         raise KeyError(f"Page {page_id} does not exist")
 
@@ -199,15 +203,16 @@ class BPlusPager:
 
     def flush(self):
         """
-        Write every cached page and the meta page to disk.
+        Write every dirty page and the meta page to disk.
 
         Call this after a batch of inserts to make the tree durable.  In
         in-memory mode this is a no-op.
         """
         if self._file is None:
             return
-        for page in self._cache.values():
+        for pid, page in self._pool.dirty_pages():
             self._write_page_to_disk(page)
+            self._pool.clear_dirty(pid)
         self._write_meta()
         self._file.flush()
 
@@ -218,9 +223,41 @@ class BPlusPager:
             self._file.close()
             self._file = None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def num_pages(self) -> int:
         return self._next_id
+
+    def mark_dirty(self, page):
+        """
+        Mark a page as dirty so it is written on the next flush.
+
+        Accepts the page object (not just the ID) so that if the page was
+        evicted from the pool while a Python reference was still live, it
+        can be re-inserted before being marked dirty.
+        """
+        pid = page.page_id
+        if not self._pool.contains(pid):
+            # Page was evicted but the caller still holds a reference to it
+            # and has just modified it — put it back so the dirty write
+            # happens on the next flush.
+            self._pool_put(page, dirty=True)
+        else:
+            self._pool.mark_dirty(pid)
+
+    def _pool_put(self, page, dirty: bool):
+        """
+        Insert a page into the buffer pool, flushing any dirty evictions.
+        """
+        evicted = self._pool.put(page.page_id, page, dirty=dirty)
+        for _pid, evicted_page in evicted:
+            if self._file is not None:
+                self._write_page_to_disk(evicted_page)

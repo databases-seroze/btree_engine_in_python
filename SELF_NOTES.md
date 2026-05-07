@@ -12,7 +12,7 @@
 - [x] Cursor — next() O(1) via leaf links; prev() O(k) re-walk; reset(); for-loop iterator
 
 ### Phase 2 — Durability (in progress)
-- [ ] Buffer pool — LRU eviction, dirty-page tracking, pin/unpin
+- [x] Buffer pool — LRU eviction, dirty-page tracking, pin/unpin
 - [ ] WAL (Write-Ahead Log) — log before write, replay on crash for consistency
 
 ### Phase 3 — Transactions
