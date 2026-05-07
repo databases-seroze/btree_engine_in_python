@@ -8,8 +8,8 @@
 - [x] B+Tree — LeafPage (SlottedPage-backed), IndexPage, search/insert/range_scan
 - [x] File-backed pager — 4096-byte pages, meta page, flush/close, reopen
 - [ ] **Delete** — remove a key from the tree; handle underflow via borrow or merge
-- [ ] Engine API (`engine.py`) — put/get/delete/scan over encoded rows
-- [ ] Cursor — stateful iterator returned by scan(), next()/prev() over leaf linked list
+- [x] Engine API (`engine.py`) — put/get/delete/scan over encoded rows; context manager; file-backed
+- [x] Cursor — stateful iterator; next() via leaf linked list O(1); prev() re-walks range O(k); reset()
 
 ### Phase 2 — Durability
 - [ ] Buffer pool — LRU eviction, dirty-page tracking, pin/unpin
