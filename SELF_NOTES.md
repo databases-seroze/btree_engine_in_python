@@ -16,8 +16,27 @@
 - [x] WAL (Write-Ahead Log) — physiological: full-page images, pageLSN/flushedLSN,
       META_UPDATE for root changes, CRC32 torn-write detection, checkpoint+truncation
 
-### Phase 3 — Transactions (next)
-- [ ] Transactions — BEGIN/COMMIT/ROLLBACK built on top of WAL
+### Phase 3 — Transactions ✅
+- [x] Transactions — BEGIN/COMMIT/ROLLBACK built on top of WAL
+- [x] Read-your-writes overlay, deferred evictions, crash-safe recovery
+
+### Phase 4 — Concurrency (next)
+- [ ] Read/write locks per page (MRSW — multiple readers, one writer)
+- [ ] Deadlock detection or timeout-based prevention
+- [ ] Concurrent transaction isolation
+
+### Phase 5 — SQL / Query Layer
+- [ ] Tokenizer + parser for SELECT, INSERT, DELETE, UPDATE
+- [ ] Schema definition (CREATE TABLE, column types)
+- [ ] Table scan and index scan execution plans
+
+### Phase 6 — Secondary Indexes
+- [ ] Second B+Tree per indexed column
+- [ ] Index-on-index lookups, sync on writes
+
+### Phase 7 — Multi-table / Joins
+- [ ] Nested-loop join, hash join
+- [ ] Foreign keys
 
 ---
 
@@ -78,7 +97,11 @@ WAL file (<dbpath>.wal):
   PAGE_WRITE  record: [LSN:8][type=1:1][page_id:4][page_bytes:4096][CRC32:4]  = 4113 B
   META_UPDATE record: [LSN:8][type=3:1][root_page_id:4][CRC32:4]              = 17 B
   CHECKPOINT  record: [LSN:8][type=2:1][CRC32:4]                              = 13 B
+  TXN_BEGIN   record: [LSN:8][type=4:1][txn_id:8][CRC32:4]                      = 21 B
+  TXN_COMMIT  record: [LSN:8][type=5:1][txn_id:8][CRC32:4]                      = 21 B
+  TXN_ABORT   record: [LSN:8][type=6:1][txn_id:8][CRC32:4]                      = 21 B
   WAL is truncated to zero after each successful flush (checkpoint cycle).
+  Recovery: PAGE_WRITEs outside a TXN_BEGIN…TXN_COMMIT pair are discarded.
 ```
 
 ---
