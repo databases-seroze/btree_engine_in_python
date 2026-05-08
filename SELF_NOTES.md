@@ -11,11 +11,12 @@
 - [x] Engine API (`engine.py`) — put/get/delete/scan; context manager; in-memory + file-backed
 - [x] Cursor — next() O(1) via leaf links; prev() O(k) re-walk; reset(); for-loop iterator
 
-### Phase 2 — Durability (in progress)
+### Phase 2 — Durability ✅
 - [x] Buffer pool — LRU eviction, dirty-page tracking, pin/unpin
-- [ ] WAL (Write-Ahead Log) — log before write, replay on crash for consistency
+- [x] WAL (Write-Ahead Log) — physiological: full-page images, pageLSN/flushedLSN,
+      META_UPDATE for root changes, CRC32 torn-write detection, checkpoint+truncation
 
-### Phase 3 — Transactions
+### Phase 3 — Transactions (next)
 - [ ] Transactions — BEGIN/COMMIT/ROLLBACK built on top of WAL
 
 ---
@@ -61,15 +62,23 @@ Offset 0                  : Meta page (4096 bytes)
 Offset PAGE_SIZE + id*PAGE_SIZE : Data page for page_id=id (4096 bytes)
 
 LeafPage on disk:
-  [0]      page_type = 1
-  [1:5]    next_page_id  (uint32LE, 0xFFFFFFFF = no sibling)
-  [5:4096] SlottedPage body (4091 bytes)
+  [0:8]    page_lsn      (uint64LE — LSN of last WAL record for this page)
+  [8]      page_type = 1
+  [9:13]   next_page_id  (uint32LE, 0xFFFFFFFF = no sibling)
+  [13:4096] SlottedPage body (4083 bytes)
 
 IndexPage on disk:
-  [0]      page_type = 0
-  [1:5]    num_keys  (uint32LE)
-  [5…]     keys[]      (num_keys × uint32LE)
+  [0:8]    page_lsn      (uint64LE)
+  [8]      page_type = 0
+  [9:13]   num_keys  (uint32LE)
+  [13…]    keys[]      (num_keys × uint32LE)
   […]      children[]  ((num_keys+1) × uint32LE)
+
+WAL file (<dbpath>.wal):
+  PAGE_WRITE  record: [LSN:8][type=1:1][page_id:4][page_bytes:4096][CRC32:4]  = 4113 B
+  META_UPDATE record: [LSN:8][type=3:1][root_page_id:4][CRC32:4]              = 17 B
+  CHECKPOINT  record: [LSN:8][type=2:1][CRC32:4]                              = 13 B
+  WAL is truncated to zero after each successful flush (checkpoint cycle).
 ```
 
 ---

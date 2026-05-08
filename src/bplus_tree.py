@@ -76,6 +76,7 @@ class BPlusTree:
             root = pager.new_leaf_page()
             self._root_id          = root.page_id
             pager.root_page_id     = self._root_id
+            pager.log_meta_update()   # WAL: root_page_id is now known
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,8 +97,9 @@ class BPlusTree:
             new_root.keys      = [push_up_key]
             new_root.children  = [self._root_id, new_page_id]
             self._pager.mark_dirty(new_root)
-            self._root_id      = new_root.page_id
+            self._root_id            = new_root.page_id
             self._pager.root_page_id = self._root_id   # keep pager in sync
+            self._pager.log_meta_update()              # WAL: new root after split
 
     def range_scan(self, start_key: int, end_key: int) -> list:
         """
@@ -227,6 +229,7 @@ class BPlusTree:
             # The surviving child becomes the new root.
             self._root_id            = root.children[0]
             self._pager.root_page_id = self._root_id
+            self._pager.log_meta_update()   # WAL: new root after collapse
 
     def _borrow_or_merge(self, page, child_idx: int, parent) -> bool:
         """

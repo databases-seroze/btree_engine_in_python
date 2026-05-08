@@ -141,7 +141,7 @@ def test_leaf_page_preserves_next_page_id():
 def test_leaf_page_no_next_serialises_as_sentinel():
     leaf = LeafPage(page_id=0, max_keys=10)
     raw  = leaf.to_bytes()
-    nxt  = struct.unpack_from('<I', raw, 1)[0]
+    nxt  = struct.unpack_from('<I', raw, 9)[0]   # offset 9 = PAGE_LSN_SIZE(8) + type(1)
     assert nxt == NO_NEXT
 
 
@@ -183,7 +183,7 @@ def test_index_page_type_byte_is_zero():
 
 def test_leaf_page_type_byte_is_one():
     leaf = LeafPage(page_id=0, max_keys=4)
-    assert leaf.to_bytes()[0] == PageType.LEAF.value
+    assert leaf.to_bytes()[8] == PageType.LEAF.value   # offset 8 = after PAGE_LSN_SIZE(8)
 
 
 # ---------------------------------------------------------------------------

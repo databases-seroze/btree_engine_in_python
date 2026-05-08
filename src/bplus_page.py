@@ -16,15 +16,17 @@ On-disk formats
 ---------------
 LeafPage (4096 bytes total):
 
-  Byte 0        : page_type = PageType.LEAF.value  (1)
-  Bytes 1-4     : next_page_id  (uint32LE, NO_NEXT = 0xFFFFFFFF means no sibling)
-  Bytes 5-4095  : SlottedPage body  (LEAF_BODY_SIZE = 4091 bytes)
+  Bytes 0-7     : page_lsn  (uint64LE) — LSN of last WAL record for this page
+  Byte  8       : page_type = PageType.LEAF.value  (1)
+  Bytes 9-12    : next_page_id  (uint32LE, NO_NEXT = 0xFFFFFFFF means no sibling)
+  Bytes 13-4095 : SlottedPage body  (LEAF_BODY_SIZE = 4083 bytes)
 
 IndexPage (4096 bytes total):
 
-  Byte 0        : page_type = PageType.INDEX.value  (0)
-  Bytes 1-4     : num_keys  (uint32LE)
-  Bytes 5 …     : keys[0..n-1]        (n × uint32LE)
+  Bytes 0-7     : page_lsn  (uint64LE) — LSN of last WAL record for this page
+  Byte  8       : page_type = PageType.INDEX.value  (0)
+  Bytes 9-12    : num_keys  (uint32LE)
+  Bytes 13 …    : keys[0..n-1]        (n × uint32LE)
   …             : children[0..n]      ((n+1) × uint32LE)
 """
 
@@ -47,9 +49,10 @@ class PageType(Enum):
 _KEY_FMT  = '<I'
 _KEY_SIZE = 4
 
-# LeafPage on-disk header occupies the first 5 bytes of the 4096-byte page.
-LEAF_HEADER_SIZE = 5                          # type(1) + next_page_id(4)
-LEAF_BODY_SIZE   = PAGE_SIZE - LEAF_HEADER_SIZE  # 4091 bytes for SlottedPage
+# LeafPage on-disk header occupies the first 13 bytes of the 4096-byte page.
+PAGE_LSN_SIZE    = 8                          # page_lsn (uint64LE)
+LEAF_HEADER_SIZE = PAGE_LSN_SIZE + 1 + 4      # page_lsn(8) + type(1) + next_page_id(4) = 13
+LEAF_BODY_SIZE   = PAGE_SIZE - LEAF_HEADER_SIZE  # 4083 bytes for SlottedPage
 
 # Sentinel stored in next_page_id when there is no right sibling.
 NO_NEXT = 0xFFFF_FFFF
@@ -75,6 +78,7 @@ class LeafPage:
 
     def __init__(self, page_id: int, max_keys: int = 200):
         self.page_id      = page_id
+        self.page_lsn     = 0                # updated by WAL on each dirty mark
         self.next_page_id = None             # page_id of right sibling, or None
         self.max_keys     = max_keys
         self._page        = SlottedPage(size=LEAF_BODY_SIZE)
@@ -88,14 +92,16 @@ class LeafPage:
         Serialise this leaf page to exactly PAGE_SIZE (4096) bytes.
 
         Layout:
-            [0]     page_type  (1 byte)
-            [1:5]   next_page_id  (uint32LE; NO_NEXT when there is no sibling)
-            [5:]    SlottedPage body  (LEAF_BODY_SIZE = 4091 bytes)
+            [0:8]   page_lsn  (uint64LE)
+            [8]     page_type  (1 byte)
+            [9:13]  next_page_id  (uint32LE; NO_NEXT when there is no sibling)
+            [13:]   SlottedPage body  (LEAF_BODY_SIZE = 4083 bytes)
         """
         buf = bytearray(PAGE_SIZE)
-        buf[0] = PageType.LEAF.value
-        nxt    = NO_NEXT if self.next_page_id is None else self.next_page_id
-        struct.pack_into('<I', buf, 1, nxt)
+        struct.pack_into('<Q', buf, 0, self.page_lsn)
+        buf[PAGE_LSN_SIZE] = PageType.LEAF.value
+        nxt = NO_NEXT if self.next_page_id is None else self.next_page_id
+        struct.pack_into('<I', buf, PAGE_LSN_SIZE + 1, nxt)
         buf[LEAF_HEADER_SIZE:] = self._page.data   # exactly LEAF_BODY_SIZE bytes
         return bytes(buf)
 
@@ -112,11 +118,10 @@ class LeafPage:
         max_keys : int   — split threshold (must match the tree's order)
         """
         leaf = cls(page_id, max_keys)
-        nxt  = struct.unpack_from('<I', data, 1)[0]
+        leaf.page_lsn     = struct.unpack_from('<Q', data, 0)[0]
+        nxt               = struct.unpack_from('<I', data, PAGE_LSN_SIZE + 1)[0]
         leaf.next_page_id = None if nxt == NO_NEXT else nxt
         # Overwrite the fresh SlottedPage's data with the serialised body.
-        # The body encodes its own header (free_start, free_end, num_slots),
-        # so the SlottedPage is fully restored by this assignment.
         leaf._page.data[:] = data[LEAF_HEADER_SIZE : LEAF_HEADER_SIZE + LEAF_BODY_SIZE]
         return leaf
 
@@ -244,6 +249,7 @@ class IndexPage:
 
     def __init__(self, page_id: int, max_keys: int = 4):
         self.page_id  = page_id
+        self.page_lsn = 0                # updated by WAL on each dirty mark
         self.max_keys = max_keys
         self.keys:     list[int] = []
         self.children: list[int] = []   # page_ids; len == len(keys) + 1
@@ -257,17 +263,19 @@ class IndexPage:
         Serialise this index page to exactly PAGE_SIZE (4096) bytes.
 
         Layout:
-            [0]      page_type  (1 byte)
-            [1:5]    num_keys   (uint32LE)
-            [5 …]    keys[0..n-1]      (n × uint32LE)
+            [0:8]    page_lsn   (uint64LE)
+            [8]      page_type  (1 byte)
+            [9:13]   num_keys   (uint32LE)
+            [13 …]   keys[0..n-1]      (n × uint32LE)
             [… ]     children[0..n]    ((n+1) × uint32LE)
             rest     zeros
         """
-        buf    = bytearray(PAGE_SIZE)
-        n      = len(self.keys)
-        buf[0] = PageType.INDEX.value
-        struct.pack_into('<I', buf, 1, n)
-        offset = 5
+        buf = bytearray(PAGE_SIZE)
+        n   = len(self.keys)
+        struct.pack_into('<Q', buf, 0, self.page_lsn)
+        buf[PAGE_LSN_SIZE] = PageType.INDEX.value
+        struct.pack_into('<I', buf, PAGE_LSN_SIZE + 1, n)
+        offset = PAGE_LSN_SIZE + 5   # 13
         for k in self.keys:
             struct.pack_into('<I', buf, offset, k)
             offset += 4
@@ -288,12 +296,13 @@ class IndexPage:
         data     : bytes — PAGE_SIZE bytes read from disk
         max_keys : int   — split threshold (must match the tree's order)
         """
-        page = cls(page_id, max_keys)
-        n    = struct.unpack_from('<I', data, 1)[0]
+        page          = cls(page_id, max_keys)
+        page.page_lsn = struct.unpack_from('<Q', data, 0)[0]
+        n             = struct.unpack_from('<I', data, PAGE_LSN_SIZE + 1)[0]
         if n > 0:
-            offset       = 5
-            page.keys    = list(struct.unpack_from(f'<{n}I',   data, offset))
-            offset      += n * 4
+            offset        = PAGE_LSN_SIZE + 5   # 13
+            page.keys     = list(struct.unpack_from(f'<{n}I',   data, offset))
+            offset       += n * 4
             page.children = list(struct.unpack_from(f'<{n+1}I', data, offset))
         else:
             page.keys     = []
