@@ -149,7 +149,14 @@ class BPlusPager:
         if max_page_id >= self._next_id:
             self._next_id = max_page_id + 1
 
-        # All page changes are now in the data file — truncate the WAL.
+        # Write the corrected meta page so root_page_id and next_page_id are
+        # durable.  If we crash before this the WAL is still intact and replay
+        # will run again on the next open (idempotent).
+        self._write_meta()
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+        # All page changes are now durably in the data file — truncate WAL.
         self._wal.checkpoint()
 
     # ------------------------------------------------------------------

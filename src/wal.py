@@ -109,10 +109,63 @@ class WAL:
         # In-memory buffer: list of (lsn, record_bytes) not yet written to disk
         self._buf: list[tuple[int, bytes]] = []
 
-        mode = 'r+b' if os.path.exists(filepath) else 'w+b'
-        self._file = open(filepath, mode)
-        # Always append — seek to end so new records go after existing ones
+        if os.path.exists(filepath):
+            self._file = open(filepath, 'r+b')
+            # Scan existing records to find the highest LSN so we never reuse one.
+            self._scan_for_max_lsn()
+        else:
+            self._file = open(filepath, 'w+b')
+        # Always append — seek to end so new records go after existing ones.
         self._file.seek(0, 2)
+
+    # ------------------------------------------------------------------
+    # Internal startup helper
+    # ------------------------------------------------------------------
+
+    def _scan_for_max_lsn(self):
+        """
+        Scan the existing WAL file to find the highest valid LSN.
+
+        Called once on open when the file already exists.  Ensures
+        _next_lsn starts above any LSN already in the file so we never
+        assign a duplicate.  Stops at the first corrupt/partial record
+        (same logic as recover).
+        """
+        self._file.seek(0)
+        while True:
+            header = self._file.read(9)
+            if len(header) < 9:
+                break
+            lsn, rec_type = struct.unpack('<QB', header)
+
+            if rec_type == PAGE_WRITE:
+                rest = self._file.read(4 + _PW_DATA + _PW_CRC)
+                if len(rest) < 4 + _PW_DATA + _PW_CRC:
+                    break
+                payload    = header + rest[:-_PW_CRC]
+                crc_stored = struct.unpack_from('<I', rest, -_PW_CRC)[0]
+                if _crc(payload) != crc_stored:
+                    break
+            elif rec_type == META_UPDATE:
+                rest = self._file.read(4 + _MU_CRC)
+                if len(rest) < 4 + _MU_CRC:
+                    break
+                payload    = header + rest[:-_MU_CRC]
+                crc_stored = struct.unpack_from('<I', rest, -_MU_CRC)[0]
+                if _crc(payload) != crc_stored:
+                    break
+            elif rec_type == CHECKPOINT:
+                rest = self._file.read(_CP_CRC)
+                if len(rest) < _CP_CRC:
+                    break
+                payload    = header
+                crc_stored = struct.unpack_from('<I', rest, 0)[0]
+                if _crc(payload) != crc_stored:
+                    break
+            else:
+                break
+
+            self._next_lsn = max(self._next_lsn, lsn + 1)
 
     # ------------------------------------------------------------------
     # Append
