@@ -34,6 +34,7 @@ A relational database engine built from scratch in Python — B+Tree storage, wr
 
 | Module | Description |
 |---|---|
+| `src/repl.py` | Interactive SQL shell — input loop, table printer, meta-commands |
 | `src/database.py` | Top-level SQL interface; one Engine file per table; context manager |
 | `src/lexer.py` | Tokenises SQL strings into keyword, identifier, literal, and symbol tokens |
 | `src/parser.py` | Recursive descent parser; produces typed AST nodes |
@@ -207,6 +208,7 @@ WAL records:
 | 5 | SQL layer — lexer, parser, catalog, SELECT/INSERT/UPDATE/DELETE | Done |
 | 6 | Secondary indexes — per-column B+Trees, auto-sync, index scan | Done |
 | 7 | Joins and foreign keys — nested-loop join, index NLJ, FK enforcement | Done |
+| 8 | Interactive REPL — SQL shell with history, aligned output, meta-commands | Done |
 
 ## Getting Started
 
@@ -215,8 +217,51 @@ No external dependencies — only the Python standard library.
 ```bash
 git clone git@github.com:databases-seroze/btree_engine_in_python.git
 cd btree_engine_in_python
-pytest tests/ -v   # 442 tests
+pytest tests/ -v   # 469 tests
 ```
+
+### Running the REPL
+
+```bash
+python __main__.py mydb/
+```
+
+```
+py_btree_engine  —  database: /path/to/mydb
+Type SQL statements ending with ';', or \help for commands.
+
+db> CREATE TABLE users (id INT PRIMARY KEY, name STRING, age INT);
+OK
+db> INSERT INTO users VALUES (1, 'alice', 30);
+OK
+db> SELECT * FROM users;
++----+-------+-----+
+| id | name  | age |
++----+-------+-----+
+| 1  | alice | 30  |
++----+-------+-----+
+(1 row)
+db> \schema users
++--------+--------+-----+----+
+| column | type   | pk  | fk |
++--------+--------+-----+----+
+| id     | INT    | YES |    |
+| name   | STRING |     |    |
+| age    | INT    |     |    |
++--------+--------+-----+----+
+db> \tables
+  users
+db> \quit
+Bye.
+```
+
+**REPL features:**
+- Multi-line input — statement executes when `;` is reached
+- Up/down arrow key history (via `readline`)
+- Aligned ASCII table output with row count
+- Meta-commands: `\tables`, `\schema <table>`, `\indexes`, `\help`, `\quit`
+- Ctrl-C clears current input buffer; Ctrl-D exits
+- All errors printed without crashing the shell
 
 ## Project Structure
 
@@ -241,6 +286,7 @@ py_btree_engine/
 │   ├── buffer_pool.py
 │   ├── wal.py
 │   └── cursor.py
+├── __main__.py            # REPL entry point: python __main__.py <dbdir>
 └── tests/
     ├── test_btree.py
     ├── test_slotted_page.py
@@ -253,5 +299,6 @@ py_btree_engine/
     ├── test_concurrency.py
     ├── test_sql.py
     ├── test_indexes.py
-    └── test_joins_fkeys.py
+    ├── test_joins_fkeys.py
+    └── test_repl.py
 ```
