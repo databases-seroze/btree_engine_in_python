@@ -46,6 +46,7 @@ order : int
 from src.bplus_pager  import BPlusPager
 from src.bplus_tree   import BPlusTree
 from src.cursor       import Cursor
+from src.lock_manager import LockManager
 from src.record       import encode_record, decode_record
 from src.transaction  import Transaction
 
@@ -59,8 +60,9 @@ class Engine:
     """
 
     def __init__(self, filepath: str | None = None, order: int = 100):
-        self._pager = BPlusPager(filepath, order=order)
-        self._tree  = BPlusTree(self._pager)
+        self._pager        = BPlusPager(filepath, order=order)
+        self._tree         = BPlusTree(self._pager)
+        self._lock_manager = LockManager()
 
     # ------------------------------------------------------------------
     # Core operations

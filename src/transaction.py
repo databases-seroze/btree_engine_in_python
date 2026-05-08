@@ -77,6 +77,7 @@ class Transaction:
 
     def __init__(self, engine):
         self._engine   = engine
+        self._lm       = engine._lock_manager
         self._txn_id   = engine._pager.alloc_txn_id()
         # Buffered ops: list of ('put', key, record_bytes) or ('delete', key)
         self._ops:     list  = []
@@ -98,6 +99,7 @@ class Transaction:
         and scan(), but is not applied to the tree until commit().
         """
         self._check_open()
+        self._lm.acquire(self._txn_id, key, 'X')
         record = encode_record(row)
         self._ops.append(('put', key, record))
         self._overlay[key] = record
@@ -110,6 +112,7 @@ class Transaction:
         Subsequent get() calls within this transaction return None for key.
         """
         self._check_open()
+        self._lm.acquire(self._txn_id, key, 'X')
         self._ops.append(('delete', key))
         self._deleted.add(key)
         self._overlay.pop(key, None)
@@ -122,10 +125,12 @@ class Transaction:
         """
         Return the row for key, or None if absent.
 
-        Checks the transaction's own overlay first so that staged puts are
-        visible before commit.
+        Acquires a shared lock on *key* so that no concurrent transaction can
+        modify it until this transaction commits or rolls back.  Checks the
+        transaction's own overlay first so that staged puts are visible.
         """
         self._check_open()
+        self._lm.acquire(self._txn_id, key, 'S')
         if key in self._deleted:
             return None
         if key in self._overlay:
@@ -137,8 +142,13 @@ class Transaction:
         Return [(key, row), ...] for all keys in [start, end], reflecting
         this transaction's staged writes.
 
-        Merges the committed tree's range with the overlay and deleted set.
-        Returns a materialised list sorted by key (not a lazy cursor).
+        Acquires a shared lock on every key in the result set so that no
+        concurrent transaction can modify those rows until this transaction
+        commits or rolls back.
+
+        Note: new keys inserted into the range by concurrent transactions
+        after this scan completes are not locked (phantom reads).  Full
+        range/predicate locking is deferred to a later phase.
         """
         self._check_open()
         # Start from the committed tree's range
@@ -150,7 +160,11 @@ class Transaction:
         for k, v in self._overlay.items():
             if start <= k <= end:
                 base[k] = v
-        return [(k, decode_record(v)) for k, v in sorted(base.items())]
+        result = [(k, decode_record(v)) for k, v in sorted(base.items())]
+        # Acquire S locks on every key we are about to return.
+        for k, _ in result:
+            self._lm.acquire(self._txn_id, k, 'S')
+        return result
 
     # ------------------------------------------------------------------
     # Commit / Rollback
@@ -199,6 +213,9 @@ class Transaction:
             # Step 6: safe to flush deferred evictions now
             pager.end_txn_write()
 
+        # Step 7: release all locks — other transactions may now proceed
+        self._lm.release_all(self._txn_id)
+
     def rollback(self) -> None:
         """
         Discard all staged operations.
@@ -214,6 +231,8 @@ class Transaction:
             wal = self._engine._pager._wal
             if wal is not None:
                 wal.append_txn_abort(self._txn_id)
+
+        self._lm.release_all(self._txn_id)
 
     # ------------------------------------------------------------------
     # Context manager

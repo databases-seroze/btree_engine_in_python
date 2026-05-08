@@ -367,16 +367,34 @@ def test_context_manager_re_raises_exception():
 # ===========================================================================
 
 def test_second_txn_does_not_see_first_txn_before_commit():
-    """Before txn1 commits, txn2 must not see its writes (sequential)."""
+    """
+    While txn1 holds X(key=1), txn2 is blocked — it cannot read the key
+    at all until txn1 commits (writer blocks readers).  Once txn1 commits,
+    txn2 sees the committed value.
+    """
+    import threading
     db = make_db()
     txn1 = db.begin()
     txn1.put(1, [1, "txn1"])
-    # txn2 starts before txn1 commits — but since single-threaded, txn2
-    # reads the committed engine state which doesn't have key 1 yet
-    txn2 = db.begin()
-    assert txn2.get(1) is None   # txn1 not committed yet
+
+    read_result = [None]
+    read_done   = threading.Event()
+
+    def txn2_read():
+        txn2 = db.begin()
+        read_result[0] = txn2.get(1)   # blocks until txn1 commits
+        txn2.rollback()
+        read_done.set()
+
+    t = threading.Thread(target=txn2_read, daemon=True)
+    t.start()
+
+    assert not read_done.wait(timeout=0.1), "txn2 should be blocked by txn1's X lock"
     txn1.commit()
-    txn2.rollback()
+
+    assert read_done.wait(timeout=2.0), "txn2 should unblock after txn1 commits"
+    assert read_result[0] == [1, "txn1"]
+    t.join(timeout=1.0)
     db.close()
 
 
