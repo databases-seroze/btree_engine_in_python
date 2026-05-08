@@ -20,10 +20,12 @@
 - [x] Transactions — BEGIN/COMMIT/ROLLBACK built on top of WAL
 - [x] Read-your-writes overlay, deferred evictions, crash-safe recovery
 
-### Phase 4 — Concurrency (next)
-- [ ] Read/write locks per page (MRSW — multiple readers, one writer)
-- [ ] Deadlock detection or timeout-based prevention
-- [ ] Concurrent transaction isolation
+### Phase 4 — Concurrency ✅
+- [x] Key-level S/X locks via LockManager (multiple readers, serialized writers)
+- [x] Lock upgrade: S → X, immediate if sole holder, waits otherwise
+- [x] FIFO waiter queue — prevents X-lock starvation
+- [x] Wait-for graph + DFS cycle detection → DeadlockError before blocking
+- [x] Strict 2PL: locks held until commit/rollback (serializability)
 
 ### Phase 5 — SQL / Query Layer
 - [ ] Tokenizer + parser for SELECT, INSERT, DELETE, UPDATE
@@ -103,6 +105,29 @@ WAL file (<dbpath>.wal):
   WAL is truncated to zero after each successful flush (checkpoint cycle).
   Recovery: PAGE_WRITEs outside a TXN_BEGIN…TXN_COMMIT pair are discarded.
 ```
+
+---
+
+## Concurrency — design notes
+
+Two-phase locking (2PL) at the key level:
+
+- **S lock** (shared/read): multiple txns may hold simultaneously.
+- **X lock** (exclusive/write): only one txn; incompatible with S and X.
+- `get/scan` → acquire S; `put/delete` → acquire X.
+- **Upgrade** (S → X): if no other S holders, granted immediately.  Otherwise
+  waits — keeping the S hold — until all other S holders release.  Two txns
+  trying to upgrade simultaneously cause a deadlock (detected by cycle check).
+- **Strict 2PL**: all locks released at once on commit/rollback, not earlier.
+  This is what gives serializability.
+- **FIFO queue**: waiters served in arrival order; we stop at the first
+  incompatible waiter so an X request cannot be starved by a stream of S requests.
+- **Deadlock detection**: before blocking, DFS the wait-for graph.  If the new
+  edges complete a cycle, raise `DeadlockError` for the txn that would close it.
+  Caller must rollback (which calls `release_all`, unblocking other waiters).
+- **Phantom reads**: scan() locks individual keys in its result, not the range.
+  A new key inserted into the scanned range by a concurrent txn is not locked.
+  Full predicate/range locking is deferred to a later phase.
 
 ---
 
