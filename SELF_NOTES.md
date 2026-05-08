@@ -27,10 +27,12 @@
 - [x] Wait-for graph + DFS cycle detection → DeadlockError before blocking
 - [x] Strict 2PL: locks held until commit/rollback (serializability)
 
-### Phase 5 — SQL / Query Layer
-- [ ] Tokenizer + parser for SELECT, INSERT, DELETE, UPDATE
-- [ ] Schema definition (CREATE TABLE, column types)
-- [ ] Table scan and index scan execution plans
+### Phase 5 — SQL / Query Layer ✅
+- [x] Lexer — tokenises SQL; keywords, literals, symbols, identifiers
+- [x] Parser — recursive descent; produces typed AST nodes
+- [x] Catalog — JSON-backed schema registry; survives close/reopen
+- [x] Executor — access path selection: PK equality → get(), PK BETWEEN → scan(), else full scan + filter
+- [x] Database — top-level interface; one Engine file per table; context manager
 
 ### Phase 6 — Secondary Indexes
 - [ ] Second B+Tree per indexed column
