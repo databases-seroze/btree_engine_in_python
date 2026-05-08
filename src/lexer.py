@@ -42,9 +42,12 @@ class TT(Enum):
     NULL    = auto()
     INT     = auto()
     STRING  = auto()
-    INDEX   = auto()
-    ON      = auto()
-    DROP    = auto()
+    INDEX      = auto()
+    ON         = auto()
+    DROP       = auto()
+    JOIN       = auto()
+    REFERENCES = auto()
+    DOT        = auto()   # .
     # Symbols
     STAR   = auto()   # *
     LPAREN = auto()   # (
@@ -85,9 +88,11 @@ _KEYWORDS: dict[str, TT] = {
     'NULL':    TT.NULL,
     'INT':     TT.INT,
     'STRING':  TT.STRING,
-    'INDEX':   TT.INDEX,
-    'ON':      TT.ON,
-    'DROP':    TT.DROP,
+    'INDEX':      TT.INDEX,
+    'ON':         TT.ON,
+    'DROP':       TT.DROP,
+    'JOIN':       TT.JOIN,
+    'REFERENCES': TT.REFERENCES,
 }
 
 
@@ -183,6 +188,8 @@ class Lexer:
                 self._pos += 1
                 return Token(TT.GTE, '>=', pos)
             return Token(TT.GT, '>', pos)
+        if ch == '.':
+            return Token(TT.DOT, '.', pos)
         if ch == '!':
             if self._pos < len(self._text) and self._text[self._pos] == '=':
                 self._pos += 1

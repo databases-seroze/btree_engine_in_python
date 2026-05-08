@@ -62,6 +62,15 @@ class IndexSchema:
     col_idx: int   # position of that column in the table's column list
 
 
+@dataclass
+class ForeignKeySchema:
+    child_table:  str   # table that holds the FK column
+    child_col:    str   # FK column name in child table
+    child_col_idx: int  # its position in child table's column list
+    parent_table: str   # referenced table
+    parent_col:   str   # referenced column in parent table
+
+
 # ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
@@ -82,8 +91,9 @@ class Catalog:
 
     def __init__(self, dirpath: str):
         self._path    = os.path.join(dirpath, 'catalog.json')
-        self._tables: dict = {}   # name → TableSchema
-        self._indexes: dict = {}  # name → IndexSchema
+        self._tables: dict  = {}   # name → TableSchema
+        self._indexes: dict = {}   # name → IndexSchema
+        self._fkeys:  list  = []   # list[ForeignKeySchema]
         if os.path.exists(self._path):
             self._load()
 
@@ -105,6 +115,22 @@ class Catalog:
             pk_idx  = pk_idx,
         )
         self._tables[name] = schema
+
+        # Register any REFERENCES declarations as foreign keys
+        for idx, col in enumerate(columns):
+            if col.fk_table is not None:
+                if col.fk_table not in self._tables:
+                    raise CatalogError(
+                        f"Foreign key references unknown table '{col.fk_table}'"
+                    )
+                self._fkeys.append(ForeignKeySchema(
+                    child_table   = name,
+                    child_col     = col.name,
+                    child_col_idx = idx,
+                    parent_table  = col.fk_table,
+                    parent_col    = col.fk_col,
+                ))
+
         self._save()
         return schema
 
@@ -173,6 +199,18 @@ class Catalog:
         return list(self._indexes.values())
 
     # ------------------------------------------------------------------
+    # Foreign key API
+    # ------------------------------------------------------------------
+
+    def get_fkeys_from(self, child_table: str) -> list:
+        """Return FK constraints where *child_table* is the child (holds the FK)."""
+        return [fk for fk in self._fkeys if fk.child_table == child_table]
+
+    def get_fkeys_to(self, parent_table: str) -> list:
+        """Return FK constraints where *parent_table* is the referenced table."""
+        return [fk for fk in self._fkeys if fk.parent_table == parent_table]
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -194,8 +232,21 @@ class Catalog:
                 'col':     idx.col,
                 'col_idx': idx.col_idx,
             }
+        fkeys_data = [
+            {
+                'child_table':    fk.child_table,
+                'child_col':      fk.child_col,
+                'child_col_idx':  fk.child_col_idx,
+                'parent_table':   fk.parent_table,
+                'parent_col':     fk.parent_col,
+            }
+            for fk in self._fkeys
+        ]
         with open(self._path, 'w') as f:
-            json.dump({'tables': tables_data, 'indexes': indexes_data}, f, indent=2)
+            json.dump(
+                {'tables': tables_data, 'indexes': indexes_data, 'fkeys': fkeys_data},
+                f, indent=2
+            )
 
     def _load(self):
         with open(self._path) as f:
@@ -228,3 +279,12 @@ class Catalog:
                 col     = id['col'],
                 col_idx = id['col_idx'],
             )
+
+        for fk in data.get('fkeys', []):
+            self._fkeys.append(ForeignKeySchema(
+                child_table   = fk['child_table'],
+                child_col     = fk['child_col'],
+                child_col_idx = fk['child_col_idx'],
+                parent_table  = fk['parent_table'],
+                parent_col    = fk['parent_col'],
+            ))

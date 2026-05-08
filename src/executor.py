@@ -17,10 +17,10 @@ Rows are represented as plain Python dicts: {column_name: value}.
 import os
 
 from src.ast_nodes import (
-    ColumnDef,
+    ColumnDef, ColRef,
     EqExpr, CompareExpr, BetweenExpr, AndExpr, OrExpr,
     CreateTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt,
-    CreateIndexStmt, DropIndexStmt,
+    CreateIndexStmt, DropIndexStmt, JoinSelectStmt,
 )
 from src.catalog       import Catalog, TableSchema, CatalogError
 from src.engine        import Engine
@@ -78,6 +78,54 @@ def _project(row: dict, columns: list) -> dict:
     return {c: row[c] for c in columns}
 
 
+def _eval_join_expr(expr, row: dict) -> bool:
+    """Like _eval_expr but col may be a ColRef (table.col) or plain str."""
+    if expr is None:
+        return True
+    if isinstance(expr, EqExpr):
+        key = f"{expr.col.table}.{expr.col.col}" if isinstance(expr.col, ColRef) else expr.col
+        return row.get(key) == expr.value
+    if isinstance(expr, CompareExpr):
+        key = f"{expr.col.table}.{expr.col.col}" if isinstance(expr.col, ColRef) else expr.col
+        val = row.get(key)
+        if val is None:
+            return False
+        op = expr.op
+        if op == '<':  return val <  expr.value
+        if op == '>':  return val >  expr.value
+        if op == '<=': return val <= expr.value
+        if op == '>=': return val >= expr.value
+        if op == '!=': return val != expr.value
+    if isinstance(expr, BetweenExpr):
+        key = f"{expr.col.table}.{expr.col.col}" if isinstance(expr.col, ColRef) else expr.col
+        val = row.get(key)
+        return val is not None and expr.low <= val <= expr.high
+    if isinstance(expr, AndExpr):
+        return _eval_join_expr(expr.left, row) and _eval_join_expr(expr.right, row)
+    if isinstance(expr, OrExpr):
+        return _eval_join_expr(expr.left, row) or _eval_join_expr(expr.right, row)
+    raise ExecutionError(f"Unknown expression type {type(expr).__name__}")
+
+
+def _project_join(row: dict, columns: list, left_table: str, right_table: str) -> dict:
+    """Project a merged join row.  '*' returns all qualified columns."""
+    if columns == ['*']:
+        # Return only the qualified names to avoid duplicates
+        return {k: v for k, v in row.items() if '.' in k}
+    result = {}
+    for col in columns:
+        if isinstance(col, ColRef):
+            qualified = f"{col.table}.{col.col}"
+            if qualified not in row:
+                raise ExecutionError(f"Unknown column: {col.table}.{col.col}")
+            result[qualified] = row[qualified]
+        else:
+            if col not in row:
+                raise ExecutionError(f"Unknown column: {col}")
+            result[col] = row[col]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -110,6 +158,8 @@ class Executor:
             return self._exec_drop_index(stmt)
         if isinstance(stmt, InsertStmt):
             return self._exec_insert(stmt)
+        if isinstance(stmt, JoinSelectStmt):
+            return self._exec_join_select(stmt)
         if isinstance(stmt, SelectStmt):
             return self._exec_select(stmt)
         if isinstance(stmt, UpdateStmt):
@@ -165,6 +215,16 @@ class Executor:
             raise ExecutionError(
                 f"PRIMARY KEY value must be INT, got {type(pk_val).__name__}"
             )
+        # FK check: every REFERENCES column must point to an existing parent row
+        for fk in self._catalog.get_fkeys_from(stmt.table):
+            fk_val = stmt.values[fk.child_col_idx]
+            if fk_val is not None:
+                parent_engine = self._get_engine(fk.parent_table)
+                if parent_engine.get(fk_val) is None:
+                    raise ExecutionError(
+                        f"Foreign key violation: '{stmt.table}.{fk.child_col}' = {fk_val} "
+                        f"does not exist in '{fk.parent_table}.{fk.parent_col}'"
+                    )
         engine = self._get_engine(stmt.table)
         engine.put(pk_val, stmt.values)
         if self._index_mgr:
@@ -215,17 +275,101 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _exec_delete(self, stmt: DeleteStmt) -> list:
-        schema = self._catalog.get_table(stmt.table)
-        engine = self._get_engine(stmt.table)
+        schema    = self._catalog.get_table(stmt.table)
+        engine    = self._get_engine(stmt.table)
         col_names = [c.name for c in schema.columns]
-        rows   = self._fetch_rows(schema, engine, stmt.where)
+        rows      = self._fetch_rows(schema, engine, stmt.where)
         for row_dict in rows:
             pk = row_dict[schema.pk_col]
+            # FK check: no child row may reference this PK
+            for fk in self._catalog.get_fkeys_to(stmt.table):
+                child_engine = self._get_engine(fk.child_table)
+                child_schema = self._catalog.get_table(fk.child_table)
+                # Use secondary index on FK column if available, else full scan
+                child_rows = self._fetch_rows(
+                    child_schema, child_engine,
+                    EqExpr(col=fk.child_col, value=pk)
+                )
+                if child_rows:
+                    raise ExecutionError(
+                        f"Foreign key violation: cannot delete '{stmt.table}' row "
+                        f"with {schema.pk_col}={pk} — "
+                        f"referenced by '{fk.child_table}.{fk.child_col}'"
+                    )
             engine.delete(pk)
             if self._index_mgr:
                 old_row = [row_dict[c] for c in col_names]
                 self._index_mgr.on_delete(schema, old_row)
         return []
+
+    # ------------------------------------------------------------------
+    # JOIN SELECT
+    # ------------------------------------------------------------------
+
+    def _exec_join_select(self, stmt: JoinSelectStmt) -> list:
+        left_schema  = self._catalog.get_table(stmt.left_table)
+        right_schema = self._catalog.get_table(stmt.right_table)
+        left_engine  = self._get_engine(stmt.left_table)
+        right_engine = self._get_engine(stmt.right_table)
+
+        # Fetch all left rows (full scan of outer table)
+        left_rows = [
+            _to_dict(left_schema, row)
+            for _, row in left_engine.scan()
+        ]
+
+        # For each left row, probe the right table using the join key.
+        # Use secondary index on right join col if available (index NLJ),
+        # otherwise fall back to equality fetch (if it's the PK) or full scan.
+        result = []
+        for lrow in left_rows:
+            join_val = lrow.get(stmt.left_col)
+            if join_val is None:
+                continue
+
+            # Access path for right side
+            if stmt.right_col == right_schema.pk_col:
+                raw = right_engine.get(join_val)
+                right_matches = [_to_dict(right_schema, raw)] if raw else []
+            elif self._index_mgr:
+                idx = self._index_mgr.has_index_on(stmt.right_table, stmt.right_col)
+                if idx:
+                    pks = self._index_mgr.lookup(idx.name, join_val)
+                    right_matches = [
+                        _to_dict(right_schema, row)
+                        for pk in pks
+                        if (row := right_engine.get(pk)) is not None
+                    ]
+                else:
+                    right_matches = self._fetch_rows(
+                        right_schema, right_engine,
+                        EqExpr(col=stmt.right_col, value=join_val)
+                    )
+            else:
+                right_matches = self._fetch_rows(
+                    right_schema, right_engine,
+                    EqExpr(col=stmt.right_col, value=join_val)
+                )
+
+            for rrow in right_matches:
+                # Merge rows: prefix ambiguous columns with table name
+                merged = {}
+                for k, v in lrow.items():
+                    merged[f"{stmt.left_table}.{k}"] = v
+                    merged[k] = v   # unqualified alias (left wins on conflict)
+                for k, v in rrow.items():
+                    merged[f"{stmt.right_table}.{k}"] = v
+                    if k not in merged:
+                        merged[k] = v
+
+                # Apply post-join WHERE filter
+                if stmt.where is not None and not _eval_join_expr(stmt.where, merged):
+                    continue
+
+                result.append(_project_join(merged, stmt.columns,
+                                            stmt.left_table, stmt.right_table))
+
+        return result
 
     # ------------------------------------------------------------------
     # Access path selection

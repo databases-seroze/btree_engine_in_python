@@ -31,6 +31,9 @@ class ColumnDef:
     name:        str
     col_type:    str   # 'INT' | 'STRING'
     primary_key: bool = False
+    # Foreign key fields (None = no FK on this column)
+    fk_table:    str | None = None   # referenced table name
+    fk_col:      str | None = None   # referenced column name
 
 
 # ---------------------------------------------------------------------------
@@ -115,3 +118,21 @@ class CreateIndexStmt:
 @dataclass
 class DropIndexStmt:
     name: str
+
+
+# Dotted column reference: table.column  (used in JoinSelectStmt)
+@dataclass
+class ColRef:
+    table: str
+    col:   str
+
+
+@dataclass
+class JoinSelectStmt:
+    """SELECT ... FROM left JOIN right ON left.col = right.col WHERE ..."""
+    left_table:  str
+    right_table: str
+    left_col:    str          # join key in left table
+    right_col:   str          # join key in right table
+    columns:     list         # list of ColRef or '*'
+    where:       Any = None   # post-join filter (ColRef-based predicates)

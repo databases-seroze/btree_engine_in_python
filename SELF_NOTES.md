@@ -44,9 +44,15 @@
 - [x] Indexes persist across close/reopen; multiple indexes per table supported
 - [x] Limitation: only INT columns can be indexed (B+Tree keys are uint32)
 
-### Phase 7 — Multi-table / Joins
-- [ ] Nested-loop join, hash join
-- [ ] Foreign keys
+### Phase 7 — Multi-table / Joins ✅
+- [x] REFERENCES col in CREATE TABLE → ForeignKeySchema in catalog (persisted)
+- [x] FK INSERT check: referenced parent row must exist (NULL skipped)
+- [x] FK DELETE check: no child rows may reference the deleted PK (no CASCADE)
+- [x] JOIN SELECT: nested-loop join with index NLJ when right join col is indexed
+- [x] ON clause normalisation: either side order accepted, swapped to left=left
+- [x] Post-join WHERE with dotted ColRef predicates (table.col op value)
+- [x] Column projection: SELECT table.col or SELECT * (qualified names returned)
+- [x] Merged row dict: qualified (table.col) and unqualified aliases both present
 
 ---
 

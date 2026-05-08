@@ -25,14 +25,17 @@ Supported statements
     DELETE FROM t WHERE col1 = 1
     CREATE INDEX idx_age ON users (age)
     DROP INDEX idx_age
+    CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users (id), amount INT)
+    SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id
+    SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 100
 """
 
 from src.lexer    import Lexer, Token, TT
 from src.ast_nodes import (
-    ColumnDef,
+    ColumnDef, ColRef,
     EqExpr, CompareExpr, BetweenExpr, AndExpr, OrExpr,
     CreateTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt,
-    CreateIndexStmt, DropIndexStmt,
+    CreateIndexStmt, DropIndexStmt, JoinSelectStmt,
 )
 
 
@@ -170,7 +173,16 @@ class Parser:
             self._expect(TT.KEY)
             pk = True
 
-        return ColumnDef(name=name, col_type=col_type, primary_key=pk)
+        fk_table = fk_col = None
+        if self._match(TT.REFERENCES):
+            self._advance()
+            fk_table = self._expect(TT.IDENT).value
+            self._expect(TT.LPAREN)
+            fk_col = self._expect(TT.IDENT).value
+            self._expect(TT.RPAREN)
+
+        return ColumnDef(name=name, col_type=col_type, primary_key=pk,
+                         fk_table=fk_table, fk_col=fk_col)
 
     # ------------------------------------------------------------------
     # INSERT
@@ -196,28 +208,70 @@ class Parser:
     # SELECT
     # ------------------------------------------------------------------
 
-    def _parse_select(self) -> SelectStmt:
+    def _parse_select(self):
         self._expect(TT.SELECT)
         columns = self._parse_column_list()
         self._expect(TT.FROM)
-        table = self._expect(TT.IDENT).value
+        left_table = self._expect(TT.IDENT).value
+
+        # JOIN?
+        if self._match(TT.JOIN):
+            self._advance()
+            right_table = self._expect(TT.IDENT).value
+            self._expect(TT.ON)
+            # ON left_table.col = right_table.col
+            left_ref  = self._parse_col_ref()
+            self._expect(TT.EQ)
+            right_ref = self._parse_col_ref()
+            # normalise: left_ref must belong to left_table
+            if left_ref.table == right_table and right_ref.table == left_table:
+                left_ref, right_ref = right_ref, left_ref
+            where = None
+            if self._match(TT.WHERE):
+                self._advance()
+                where = self._parse_join_where()
+            return JoinSelectStmt(
+                left_table  = left_table,
+                right_table = right_table,
+                left_col    = left_ref.col,
+                right_col   = right_ref.col,
+                columns     = columns,
+                where       = where,
+            )
 
         where = None
         if self._match(TT.WHERE):
             self._advance()
             where = self._parse_where()
 
-        return SelectStmt(table=table, columns=columns, where=where)
+        return SelectStmt(table=left_table, columns=columns, where=where)
+
+    def _parse_col_ref(self) -> ColRef:
+        """Parse table.column — both parts are IDENT tokens."""
+        table = self._expect(TT.IDENT).value
+        self._expect(TT.DOT)
+        col   = self._expect(TT.IDENT).value
+        return ColRef(table=table, col=col)
 
     def _parse_column_list(self) -> list:
+        """Parse SELECT column list — supports *, plain names, and table.col."""
         if self._match(TT.STAR):
             self._advance()
             return ['*']
-        cols = [self._expect(TT.IDENT).value]
+        cols = [self._parse_select_col()]
         while self._match(TT.COMMA):
             self._advance()
-            cols.append(self._expect(TT.IDENT).value)
+            cols.append(self._parse_select_col())
         return cols
+
+    def _parse_select_col(self):
+        """Parse one item in a SELECT list: either 'col' or 'table.col'."""
+        name = self._expect(TT.IDENT).value
+        if self._match(TT.DOT):
+            self._advance()
+            col = self._expect(TT.IDENT).value
+            return ColRef(table=name, col=col)
+        return name   # plain column name (single-table SELECT)
 
     # ------------------------------------------------------------------
     # UPDATE
@@ -296,6 +350,47 @@ class Parser:
         raise ParseError(
             f"Expected comparison operator after column '{col}', "
             f"got {tok.type.name} at position {tok.pos}"
+        )
+
+    # ------------------------------------------------------------------
+    # JOIN WHERE clause  (uses ColRef predicates: table.col op value)
+    # ------------------------------------------------------------------
+
+    def _parse_join_where(self):
+        left = self._parse_join_predicate()
+        while self._match(TT.AND):
+            self._advance()
+            right = self._parse_join_predicate()
+            left  = AndExpr(left=left, right=right)
+        return left
+
+    def _parse_join_predicate(self):
+        """Parse table.col op value or plain col op value."""
+        name = self._expect(TT.IDENT).value
+        if self._match(TT.DOT):
+            self._advance()
+            col_name = self._expect(TT.IDENT).value
+            col = ColRef(table=name, col=col_name)
+        else:
+            col = name   # plain name — treated as unqualified
+
+        if self._match(TT.BETWEEN):
+            self._advance()
+            low  = self._parse_literal()
+            self._expect(TT.AND)
+            high = self._parse_literal()
+            return BetweenExpr(col=col, low=low, high=high)
+
+        if self._match(TT.EQ, TT.NEQ, TT.LT, TT.GT, TT.LTE, TT.GTE):
+            op_tok = self._advance()
+            value  = self._parse_literal()
+            if op_tok.type == TT.EQ:
+                return EqExpr(col=col, value=value)
+            return CompareExpr(col=col, op=op_tok.value, value=value)
+
+        tok = self._peek()
+        raise ParseError(
+            f"Expected comparison operator, got {tok.type.name} at pos {tok.pos}"
         )
 
     # ------------------------------------------------------------------
