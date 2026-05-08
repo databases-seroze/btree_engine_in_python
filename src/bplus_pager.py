@@ -98,6 +98,12 @@ class BPlusPager:
         self.root_page_id: int | None = None
         self._file:     IO[bytes] | None = None
         self._wal:      WAL | None = None
+        # Transaction support: when True, buffer pool evictions are deferred
+        # so that no partially-committed pages reach the data file before
+        # TXN_COMMIT is fsynced to the WAL.
+        self._txn_writing:        bool = False
+        self._deferred_evictions: list = []
+        self._next_txn_id:        int  = 1
 
         if filepath is not None:
             if os.path.exists(filepath):
@@ -355,6 +361,12 @@ class BPlusPager:
     def num_pages(self) -> int:
         return self._next_id
 
+    def alloc_txn_id(self) -> int:
+        """Return a monotonically increasing transaction ID."""
+        txn_id = self._next_txn_id
+        self._next_txn_id += 1
+        return txn_id
+
     def log_meta_update(self):
         """
         Append a META_UPDATE WAL record with the current root_page_id.
@@ -366,17 +378,47 @@ class BPlusPager:
         if self._wal is not None:
             self._wal.append_meta_update(self.root_page_id)
 
+    def begin_txn_write(self):
+        """
+        Signal that an explicit transaction is about to apply its ops.
+
+        While _txn_writing is True, buffer pool evictions are deferred —
+        no modified page can reach the data file before TXN_COMMIT is fsynced.
+        """
+        self._txn_writing        = True
+        self._deferred_evictions = []
+
+    def end_txn_write(self):
+        """
+        Signal that TXN_COMMIT has been fsynced.
+
+        Flushes all pages that were deferred during the transaction apply phase.
+        These pages are safe to write because TXN_COMMIT is now on disk.
+        """
+        self._txn_writing = False
+        for evicted_page in self._deferred_evictions:
+            if self._file is not None:
+                if self._wal is not None and evicted_page.page_lsn > self._wal.flushed_lsn:
+                    self._wal.fsync_up_to(evicted_page.page_lsn)
+                self._write_page_to_disk(evicted_page)
+        self._deferred_evictions = []
+
     def _pool_put(self, page, dirty: bool):
         """
         Insert a page into the buffer pool, handling dirty evictions.
 
         For file-backed pagers, an evicted dirty page must have its WAL
         record on disk before the page bytes reach the data file.
+        When _txn_writing is True, evictions are deferred so that no
+        partially-committed page reaches disk before TXN_COMMIT is fsynced.
         """
         evicted = self._pool.put(page.page_id, page, dirty=dirty)
         for _pid, evicted_page in evicted:
             if self._file is not None:
-                # Enforce WAL-before-page: fsync WAL up to this page's LSN.
-                if self._wal is not None and evicted_page.page_lsn > self._wal.flushed_lsn:
-                    self._wal.fsync_up_to(evicted_page.page_lsn)
-                self._write_page_to_disk(evicted_page)
+                if self._txn_writing:
+                    # Defer: the transaction hasn't committed yet.
+                    self._deferred_evictions.append(evicted_page)
+                else:
+                    if self._wal is not None and evicted_page.page_lsn > self._wal.flushed_lsn:
+                        self._wal.fsync_up_to(evicted_page.page_lsn)
+                    self._write_page_to_disk(evicted_page)

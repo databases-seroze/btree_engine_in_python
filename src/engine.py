@@ -43,10 +43,11 @@ order : int
     the file's meta page.  Defaults to 100 (reasonable for 4 KB pages).
 """
 
-from src.bplus_pager import BPlusPager
-from src.bplus_tree  import BPlusTree
-from src.cursor      import Cursor
-from src.record      import encode_record, decode_record
+from src.bplus_pager  import BPlusPager
+from src.bplus_tree   import BPlusTree
+from src.cursor       import Cursor
+from src.record       import encode_record, decode_record
+from src.transaction  import Transaction
 
 
 class Engine:
@@ -58,8 +59,8 @@ class Engine:
     """
 
     def __init__(self, filepath: str | None = None, order: int = 100):
-        pager       = BPlusPager(filepath, order=order)
-        self._tree  = BPlusTree(pager)
+        self._pager = BPlusPager(filepath, order=order)
+        self._tree  = BPlusTree(self._pager)
 
     # ------------------------------------------------------------------
     # Core operations
@@ -107,6 +108,27 @@ class Engine:
         end   : int  upper bound (inclusive), default 2^32-1
         """
         return Cursor(self._tree, start, end)
+
+    # ------------------------------------------------------------------
+    # Transactions
+    # ------------------------------------------------------------------
+
+    def begin(self) -> 'Transaction':
+        """
+        Open a new transaction.
+
+        All put() / delete() calls on the returned Transaction object are
+        buffered until commit() is called.  Reads (get, scan) reflect the
+        transaction's own staged writes via an in-memory overlay.
+
+        Use as a context manager for automatic commit / rollback:
+
+            with db.begin() as txn:
+                txn.put(1, [1, "alice"])
+                txn.delete(2)
+            # committed on success, rolled back on exception
+        """
+        return Transaction(self)
 
     # ------------------------------------------------------------------
     # Persistence

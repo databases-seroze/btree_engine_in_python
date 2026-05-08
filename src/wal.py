@@ -16,6 +16,24 @@ On explicit flush() (checkpoint cycle):
 This keeps the WAL bounded: it only ever holds changes since the last
 flush.  On startup, if the WAL is non-empty, recovery replays it.
 
+Transaction records
+-------------------
+Explicit transactions wrap their PAGE_WRITE records in TXN_BEGIN /
+TXN_COMMIT brackets.  Recovery only applies PAGE_WRITEs that are enclosed
+by a matching TXN_BEGIN … TXN_COMMIT pair.  PAGE_WRITEs outside any
+TXN_BEGIN (implicit / auto-commit operations) are always applied.
+
+  TXN_BEGIN  (21 bytes): [LSN:8][type:1=4][txn_id:8][CRC:4]
+  TXN_COMMIT (21 bytes): [LSN:8][type:1=5][txn_id:8][CRC:4]
+  TXN_ABORT  (21 bytes): [LSN:8][type:1=6][txn_id:8][CRC:4]
+
+Recovery rule (single-threaded — at most one active explicit transaction):
+  * PAGE_WRITE with no active transaction  → apply immediately
+  * TXN_BEGIN(X)                           → start buffering for txn X
+  * PAGE_WRITE while txn X active          → buffer, don't apply yet
+  * TXN_COMMIT(X)                          → apply all buffered writes, clear
+  * TXN_ABORT(X) or EOF with active txn   → discard buffered writes (rollback)
+
 Record formats
 --------------
 PAGE_WRITE  (4113 bytes total):
@@ -66,6 +84,9 @@ import zlib
 PAGE_WRITE  = 1   # full page image
 CHECKPOINT  = 2   # checkpoint marker — WAL truncated after this
 META_UPDATE = 3   # root_page_id changed (needed for correct recovery)
+TXN_BEGIN   = 4   # start of an explicit transaction
+TXN_COMMIT  = 5   # commit of an explicit transaction
+TXN_ABORT   = 6   # rollback of an explicit transaction
 
 # Fixed-size portions of each record type
 _PW_FIXED = 8 + 1 + 4          # LSN(8) + type(1) + page_id(4)
@@ -80,6 +101,10 @@ CHECKPOINT_SIZE = _CP_FIXED + _CP_CRC               # 13 bytes
 _MU_FIXED = 8 + 1 + 4          # LSN(8) + type(1) + root_page_id(4)
 _MU_CRC   = 4
 META_UPDATE_SIZE = _MU_FIXED + _MU_CRC              # 17 bytes
+
+_TX_FIXED = 8 + 1 + 8          # LSN(8) + type(1) + txn_id(8)
+_TX_CRC   = 4
+TXN_RECORD_SIZE = _TX_FIXED + _TX_CRC              # 21 bytes
 
 _NO_ROOT = 0xFFFF_FFFF          # sentinel for root_page_id = None
 
@@ -154,6 +179,14 @@ class WAL:
                 crc_stored = struct.unpack_from('<I', rest, -_MU_CRC)[0]
                 if _crc(payload) != crc_stored:
                     break
+            elif rec_type in (TXN_BEGIN, TXN_COMMIT, TXN_ABORT):
+                rest = self._file.read(8 + _TX_CRC)   # txn_id(8) + crc(4)
+                if len(rest) < 8 + _TX_CRC:
+                    break
+                payload    = header + rest[:-_TX_CRC]
+                crc_stored = struct.unpack_from('<I', rest, -_TX_CRC)[0]
+                if _crc(payload) != crc_stored:
+                    break
             elif rec_type == CHECKPOINT:
                 rest = self._file.read(_CP_CRC)
                 if len(rest) < _CP_CRC:
@@ -218,6 +251,28 @@ class WAL:
         record  = payload + struct.pack('<I', _crc(payload))
         self._buf.append((lsn, record))
         return lsn
+
+    def _append_txn_record(self, rec_type: int, txn_id: int) -> int:
+        """Internal helper for the three transaction record types."""
+        lsn     = self._next_lsn
+        self._next_lsn += 1
+
+        payload = struct.pack('<QBQ', lsn, rec_type, txn_id)
+        record  = payload + struct.pack('<I', _crc(payload))
+        self._buf.append((lsn, record))
+        return lsn
+
+    def append_txn_begin(self, txn_id: int) -> int:
+        """Buffer a TXN_BEGIN record.  Not fsynced until fsync() is called."""
+        return self._append_txn_record(TXN_BEGIN, txn_id)
+
+    def append_txn_commit(self, txn_id: int) -> int:
+        """Buffer a TXN_COMMIT record.  Caller must fsync() immediately after."""
+        return self._append_txn_record(TXN_COMMIT, txn_id)
+
+    def append_txn_abort(self, txn_id: int) -> int:
+        """Buffer a TXN_ABORT record."""
+        return self._append_txn_record(TXN_ABORT, txn_id)
 
     # ------------------------------------------------------------------
     # Fsync
@@ -288,25 +343,49 @@ class WAL:
         """
         Replay WAL records from the beginning of the file.
 
-        For each valid PAGE_WRITE record, write_page_fn(page_id, page_bytes)
-        is called.  For each META_UPDATE record, the root_page_id is tracked.
-        Replay stops at the first corrupt CRC (torn write) or EOF.
+        Transaction semantics during replay (single-threaded engine):
+          * PAGE_WRITE / META_UPDATE outside any TXN_BEGIN → applied immediately
+            (implicit auto-commit operation).
+          * TXN_BEGIN(X)  → start buffering page writes for txn X.
+          * PAGE_WRITE while txn X active → buffered, not yet applied.
+          * META_UPDATE while txn X active → buffered.
+          * TXN_COMMIT(X) → apply all buffered writes/meta for txn X.
+          * TXN_ABORT(X)  → discard buffered writes for txn X (rollback).
+          * EOF / torn write with active txn → discard buffered writes
+            (process crashed before commit — equivalent to rollback).
+
+        Replay stops at the first corrupt CRC or EOF.
 
         Returns a dict:
             {
               "max_page_id":  int,        # highest page_id seen (-1 if none)
-              "root_page_id": int | None, # last root seen (None if no META_UPDATE)
-              "had_meta":     bool,       # True if any META_UPDATE was replayed
+              "root_page_id": int | None, # last committed root (None if no META_UPDATE)
+              "had_meta":     bool,       # True if any META_UPDATE was applied
             }
-        The caller uses this to fix up stale meta page state after recovery.
         """
         self._file.seek(0)
         max_page_id  = -1
         root_page_id = None
         had_meta     = False
 
+        # Transaction state: None = no active txn, int = active txn id
+        active_txn_id:   int | None              = None
+        # Buffered page writes for the active transaction
+        pending_pages:   list[tuple[int, bytes]] = []
+        # Buffered meta updates for the active transaction
+        pending_meta:    list[int | None]        = []
+
+        def _apply_pages(pages, meta_updates):
+            """Apply a batch of page writes and the last meta update."""
+            nonlocal max_page_id, root_page_id, had_meta
+            for pid, pb in pages:
+                write_page_fn(pid, pb)
+                max_page_id = max(max_page_id, pid)
+            if meta_updates:
+                root_page_id = meta_updates[-1]
+                had_meta     = True
+
         while True:
-            # Read the fixed LSN + type header (9 bytes)
             header = self._file.read(9)
             if len(header) < 9:
                 break   # EOF
@@ -316,7 +395,7 @@ class WAL:
             if rec_type == PAGE_WRITE:
                 rest = self._file.read(4 + _PW_DATA + _PW_CRC)
                 if len(rest) < 4 + _PW_DATA + _PW_CRC:
-                    break   # partial record — torn write, stop here
+                    break
 
                 payload    = header + rest[:-_PW_CRC]
                 crc_stored = struct.unpack_from('<I', rest, -_PW_CRC)[0]
@@ -325,11 +404,16 @@ class WAL:
 
                 page_id    = struct.unpack_from('<I', rest, 0)[0]
                 page_bytes = rest[4: 4 + _PW_DATA]
-                write_page_fn(page_id, page_bytes)
-                max_page_id = max(max_page_id, page_id)
+
+                if active_txn_id is None:
+                    # Implicit / auto-commit — apply immediately
+                    write_page_fn(page_id, page_bytes)
+                    max_page_id = max(max_page_id, page_id)
+                else:
+                    pending_pages.append((page_id, page_bytes))
 
             elif rec_type == META_UPDATE:
-                rest = self._file.read(4 + _MU_CRC)   # root_page_id(4) + crc(4)
+                rest = self._file.read(4 + _MU_CRC)
                 if len(rest) < 4 + _MU_CRC:
                     break
 
@@ -338,9 +422,44 @@ class WAL:
                 if _crc(payload) != crc_stored:
                     break
 
-                root       = struct.unpack_from('<I', rest, 0)[0]
-                root_page_id = None if root == _NO_ROOT else root
-                had_meta   = True
+                root = struct.unpack_from('<I', rest, 0)[0]
+                root_val = None if root == _NO_ROOT else root
+
+                if active_txn_id is None:
+                    root_page_id = root_val
+                    had_meta     = True
+                else:
+                    pending_meta.append(root_val)
+
+            elif rec_type in (TXN_BEGIN, TXN_COMMIT, TXN_ABORT):
+                rest = self._file.read(8 + _TX_CRC)
+                if len(rest) < 8 + _TX_CRC:
+                    break
+
+                payload    = header + rest[:-_TX_CRC]
+                crc_stored = struct.unpack_from('<I', rest, -_TX_CRC)[0]
+                if _crc(payload) != crc_stored:
+                    break
+
+                txn_id = struct.unpack_from('<Q', rest, 0)[0]
+
+                if rec_type == TXN_BEGIN:
+                    active_txn_id = txn_id
+                    pending_pages = []
+                    pending_meta  = []
+
+                elif rec_type == TXN_COMMIT:
+                    if active_txn_id == txn_id:
+                        _apply_pages(pending_pages, pending_meta)
+                    active_txn_id = None
+                    pending_pages = []
+                    pending_meta  = []
+
+                else:   # TXN_ABORT
+                    # Discard — don't apply
+                    active_txn_id = None
+                    pending_pages = []
+                    pending_meta  = []
 
             elif rec_type == CHECKPOINT:
                 rest = self._file.read(_CP_CRC)
@@ -353,9 +472,12 @@ class WAL:
                 # CHECKPOINT is a no-op during replay
 
             else:
-                break   # Unknown record type — treat as corruption
+                break   # Unknown record type
 
             self._next_lsn = max(self._next_lsn, lsn + 1)
+
+        # If an explicit transaction was active at EOF/corruption it was never
+        # committed — discard its buffered writes (implicit rollback).
 
         return {"max_page_id": max_page_id, "root_page_id": root_page_id,
                 "had_meta": had_meta}
