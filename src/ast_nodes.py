@@ -103,3 +103,15 @@ class UpdateStmt:
 class DeleteStmt:
     table: str
     where: Any = None
+
+
+@dataclass
+class CreateIndexStmt:
+    name:  str   # index name (e.g. "idx_age")
+    table: str
+    col:   str   # single column being indexed
+
+
+@dataclass
+class DropIndexStmt:
+    name: str

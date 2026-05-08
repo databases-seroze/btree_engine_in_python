@@ -34,10 +34,11 @@ dirpath : str
 
 import os
 
-from src.catalog  import Catalog
-from src.executor import Executor
-from src.lexer    import Lexer
-from src.parser   import Parser
+from src.catalog       import Catalog
+from src.executor      import Executor
+from src.index_manager import IndexManager
+from src.lexer         import Lexer
+from src.parser        import Parser
 
 
 class Database:
@@ -51,13 +52,15 @@ class Database:
 
     def __init__(self, dirpath: str):
         os.makedirs(dirpath, exist_ok=True)
-        self._dirpath  = dirpath
-        self._catalog  = Catalog(dirpath)
-        self._engines  = {}   # table_name → Engine
+        self._dirpath   = dirpath
+        self._catalog   = Catalog(dirpath)
+        self._engines   = {}   # table_name → Engine
+        self._index_mgr = IndexManager(self._catalog, dirpath)
 
-        # Re-open engines for tables that already exist on disk.
+        # Re-open engines for tables and indexes that already exist on disk.
         for table in self._catalog.all_tables():
             self._reopen_engine(table)
+        self._index_mgr.open_all()
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,13 +78,16 @@ class Database:
         """
         tokens = Lexer(sql).tokenize()
         stmt   = Parser(tokens).parse()
-        return Executor(self._catalog, self._engines, self._dirpath).execute(stmt)
+        return Executor(
+            self._catalog, self._engines, self._dirpath, self._index_mgr
+        ).execute(stmt)
 
     def close(self) -> None:
-        """Flush and close all open engines."""
+        """Flush and close all open engines and index files."""
         for engine in self._engines.values():
             engine.close()
         self._engines.clear()
+        self._index_mgr.close()
 
     # ------------------------------------------------------------------
     # Context manager

@@ -5,12 +5,11 @@ Access path selection
 ---------------------
 SELECT / UPDATE / DELETE all route through _fetch_rows(), which picks:
 
-  PK equality   WHERE pk = v         → engine.get(v)          O(log n)
-  PK range      WHERE pk BETWEEN l AND h → engine.scan(l, h)  O(log n + k)
-  Full scan     anything else         → engine.scan() + filter O(n)
-
-For UPDATE the matched rows are re-inserted with the mutated column values.
-For DELETE the matched rows' PK values are passed to engine.delete().
+  PK equality        WHERE pk = v            → engine.get(v)         O(log n)
+  PK range           WHERE pk BETWEEN l AND h → engine.scan(l, h)    O(log n + k)
+  Index equality     WHERE col = v  (indexed) → index lookup + fetch  O(log n + k)
+  Index range        WHERE col BETWEEN l AND h (indexed)              O(log n + k)
+  Full scan          anything else            → engine.scan() + filter O(n)
 
 Rows are represented as plain Python dicts: {column_name: value}.
 """
@@ -21,9 +20,11 @@ from src.ast_nodes import (
     ColumnDef,
     EqExpr, CompareExpr, BetweenExpr, AndExpr, OrExpr,
     CreateTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt,
+    CreateIndexStmt, DropIndexStmt,
 )
-from src.catalog import Catalog, TableSchema, CatalogError
-from src.engine  import Engine
+from src.catalog       import Catalog, TableSchema, CatalogError
+from src.engine        import Engine
+from src.index_manager import IndexManager
 
 
 class ExecutionError(Exception):
@@ -83,24 +84,30 @@ def _project(row: dict, columns: list) -> dict:
 
 class Executor:
     """
-    Stateless SQL executor.
+    SQL executor.
 
     Parameters
     ----------
-    catalog : Catalog
-    engines : dict          Mutable dict (table_name → Engine); modified in-place
-                            when CREATE TABLE opens a new engine.
-    dirpath : str           Directory for new Engine files.
+    catalog   : Catalog
+    engines   : dict            table_name → Engine; modified when CREATE TABLE runs.
+    dirpath   : str             Directory for new Engine files.
+    index_mgr : IndexManager    Optional; enables secondary index support.
     """
 
-    def __init__(self, catalog: Catalog, engines: dict, dirpath: str):
-        self._catalog = catalog
-        self._engines = engines
-        self._dirpath = dirpath
+    def __init__(self, catalog: Catalog, engines: dict, dirpath: str,
+                 index_mgr: IndexManager | None = None):
+        self._catalog   = catalog
+        self._engines   = engines
+        self._dirpath   = dirpath
+        self._index_mgr = index_mgr
 
     def execute(self, stmt) -> list:
         if isinstance(stmt, CreateTableStmt):
-            return self._exec_create(stmt)
+            return self._exec_create_table(stmt)
+        if isinstance(stmt, CreateIndexStmt):
+            return self._exec_create_index(stmt)
+        if isinstance(stmt, DropIndexStmt):
+            return self._exec_drop_index(stmt)
         if isinstance(stmt, InsertStmt):
             return self._exec_insert(stmt)
         if isinstance(stmt, SelectStmt):
@@ -115,11 +122,31 @@ class Executor:
     # CREATE TABLE
     # ------------------------------------------------------------------
 
-    def _exec_create(self, stmt: CreateTableStmt) -> list:
+    def _exec_create_table(self, stmt: CreateTableStmt) -> list:
         self._catalog.create_table(stmt.table, stmt.columns)
         path   = os.path.join(self._dirpath, f"{stmt.table}.db")
         engine = Engine(path)
         self._engines[stmt.table] = engine
+        return []
+
+    # ------------------------------------------------------------------
+    # CREATE INDEX / DROP INDEX
+    # ------------------------------------------------------------------
+
+    def _exec_create_index(self, stmt: CreateIndexStmt) -> list:
+        if self._index_mgr is None:
+            raise ExecutionError("IndexManager not available")
+        idx_schema   = self._catalog.create_index(stmt.name, stmt.table, stmt.col)
+        table_schema = self._catalog.get_table(stmt.table)
+        table_engine = self._get_engine(stmt.table)
+        self._index_mgr.create_index(idx_schema, table_schema, table_engine)
+        return []
+
+    def _exec_drop_index(self, stmt: DropIndexStmt) -> list:
+        if self._index_mgr is None:
+            raise ExecutionError("IndexManager not available")
+        self._catalog.drop_index(stmt.name)
+        self._index_mgr.drop_index(stmt.name)
         return []
 
     # ------------------------------------------------------------------
@@ -140,6 +167,8 @@ class Executor:
             )
         engine = self._get_engine(stmt.table)
         engine.put(pk_val, stmt.values)
+        if self._index_mgr:
+            self._index_mgr.on_insert(schema, stmt.values)
         return []
 
     # ------------------------------------------------------------------
@@ -171,10 +200,13 @@ class Executor:
 
         rows = self._fetch_rows(schema, engine, stmt.where)
         for row_dict in rows:
-            updated = [row_dict[c] for c in col_names]
+            old_row = [row_dict[c] for c in col_names]
+            new_row = old_row[:]
             for col, val in stmt.assignments.items():
-                updated[col_names.index(col)] = val
-            engine.put(row_dict[schema.pk_col], updated)
+                new_row[col_names.index(col)] = val
+            engine.put(row_dict[schema.pk_col], new_row)
+            if self._index_mgr:
+                self._index_mgr.on_update(schema, old_row, new_row)
 
         return []
 
@@ -185,34 +217,61 @@ class Executor:
     def _exec_delete(self, stmt: DeleteStmt) -> list:
         schema = self._catalog.get_table(stmt.table)
         engine = self._get_engine(stmt.table)
+        col_names = [c.name for c in schema.columns]
         rows   = self._fetch_rows(schema, engine, stmt.where)
         for row_dict in rows:
-            engine.delete(row_dict[schema.pk_col])
+            pk = row_dict[schema.pk_col]
+            engine.delete(pk)
+            if self._index_mgr:
+                old_row = [row_dict[c] for c in col_names]
+                self._index_mgr.on_delete(schema, old_row)
         return []
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Access path selection
     # ------------------------------------------------------------------
 
     def _fetch_rows(self, schema: TableSchema, engine: Engine, where) -> list:
-        """
-        Return a list of row dicts matching *where*, using the cheapest path.
-        """
-        # PK equality → point lookup
+        """Return row dicts matching *where* using the cheapest available path."""
+
+        # 1. PK equality → O(log n) point lookup
         if isinstance(where, EqExpr) and where.col == schema.pk_col:
             raw = engine.get(where.value)
             if raw is None:
                 return []
             return [_to_dict(schema, raw)]
 
-        # PK BETWEEN → index range scan
+        # 2. PK BETWEEN → O(log n + k) range scan
         if isinstance(where, BetweenExpr) and where.col == schema.pk_col:
             return [
                 _to_dict(schema, row)
                 for _, row in engine.scan(where.low, where.high)
             ]
 
-        # Full scan + filter
+        # 3. Secondary index equality → O(log n + k)
+        if isinstance(where, EqExpr) and self._index_mgr:
+            idx = self._index_mgr.has_index_on(schema.name, where.col)
+            if idx:
+                pks = self._index_mgr.lookup(idx.name, where.value)
+                return [
+                    _to_dict(schema, row)
+                    for pk in pks
+                    if (row := engine.get(pk)) is not None
+                ]
+
+        # 4. Secondary index range → O(log n + k)
+        if isinstance(where, BetweenExpr) and self._index_mgr:
+            idx = self._index_mgr.has_index_on(schema.name, where.col)
+            if idx:
+                pks = self._index_mgr.range_lookup(idx.name, where.low, where.high)
+                rows = [
+                    _to_dict(schema, row)
+                    for pk in pks
+                    if (row := engine.get(pk)) is not None
+                ]
+                return sorted(rows, key=lambda r: r[schema.pk_col])
+
+        # 5. Full scan + filter — O(n)
         return [
             _to_dict(schema, row)
             for _, row in engine.scan()

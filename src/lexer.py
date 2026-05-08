@@ -42,6 +42,9 @@ class TT(Enum):
     NULL    = auto()
     INT     = auto()
     STRING  = auto()
+    INDEX   = auto()
+    ON      = auto()
+    DROP    = auto()
     # Symbols
     STAR   = auto()   # *
     LPAREN = auto()   # (
@@ -82,6 +85,9 @@ _KEYWORDS: dict[str, TT] = {
     'NULL':    TT.NULL,
     'INT':     TT.INT,
     'STRING':  TT.STRING,
+    'INDEX':   TT.INDEX,
+    'ON':      TT.ON,
+    'DROP':    TT.DROP,
 }
 
 

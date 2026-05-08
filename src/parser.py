@@ -23,6 +23,8 @@ Supported statements
     UPDATE t SET col2 = 'carol' WHERE col1 = 1
     UPDATE t SET col2 = 'x', col3 = 99 WHERE col1 = 1
     DELETE FROM t WHERE col1 = 1
+    CREATE INDEX idx_age ON users (age)
+    DROP INDEX idx_age
 """
 
 from src.lexer    import Lexer, Token, TT
@@ -30,6 +32,7 @@ from src.ast_nodes import (
     ColumnDef,
     EqExpr, CompareExpr, BetweenExpr, AndExpr, OrExpr,
     CreateTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt,
+    CreateIndexStmt, DropIndexStmt,
 )
 
 
@@ -82,8 +85,18 @@ class Parser:
             return self._parse_update()
         if tt == TT.DELETE:
             return self._parse_delete()
+        if tt == TT.DROP:
+            return self._parse_drop_index()
         if tt == TT.CREATE:
-            return self._parse_create_table()
+            self._advance()   # consume CREATE
+            if self._match(TT.TABLE):
+                return self._parse_create_table_body()
+            if self._match(TT.INDEX):
+                return self._parse_create_index_body()
+            tok = self._peek()
+            raise ParseError(
+                f"Expected TABLE or INDEX after CREATE, got {tok.type.name} at pos {tok.pos}"
+            )
         raise ParseError(
             f"Unexpected token {self._peek().type.name!r} at position {self._peek().pos}"
         )
@@ -93,7 +106,11 @@ class Parser:
     # ------------------------------------------------------------------
 
     def _parse_create_table(self) -> CreateTableStmt:
+        # Legacy entry point (CREATE not yet consumed).
         self._expect(TT.CREATE)
+        return self._parse_create_table_body()
+
+    def _parse_create_table_body(self) -> CreateTableStmt:
         self._expect(TT.TABLE)
         table = self._expect(TT.IDENT).value
         self._expect(TT.LPAREN)
@@ -115,6 +132,22 @@ class Parser:
             raise ParseError("PRIMARY KEY column must be of type INT")
 
         return CreateTableStmt(table=table, columns=columns)
+
+    def _parse_create_index_body(self) -> CreateIndexStmt:
+        self._expect(TT.INDEX)
+        name  = self._expect(TT.IDENT).value
+        self._expect(TT.ON)
+        table = self._expect(TT.IDENT).value
+        self._expect(TT.LPAREN)
+        col   = self._expect(TT.IDENT).value
+        self._expect(TT.RPAREN)
+        return CreateIndexStmt(name=name, table=table, col=col)
+
+    def _parse_drop_index(self) -> DropIndexStmt:
+        self._expect(TT.DROP)
+        self._expect(TT.INDEX)
+        name = self._expect(TT.IDENT).value
+        return DropIndexStmt(name=name)
 
     def _parse_column_def(self) -> ColumnDef:
         name = self._expect(TT.IDENT).value

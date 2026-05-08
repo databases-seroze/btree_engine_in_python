@@ -34,9 +34,15 @@
 - [x] Executor — access path selection: PK equality → get(), PK BETWEEN → scan(), else full scan + filter
 - [x] Database — top-level interface; one Engine file per table; context manager
 
-### Phase 6 — Secondary Indexes
-- [ ] Second B+Tree per indexed column
-- [ ] Index-on-index lookups, sync on writes
+### Phase 6 — Secondary Indexes ✅
+- [x] One Engine file per index (`<index_name>.db`)
+- [x] IndexManager: on_insert / on_delete / on_update keep indexes in sync
+- [x] Back-fill: CREATE INDEX on non-empty table scans and populates the index
+- [x] DROP INDEX: closes engine, deletes files, falls back to full scan
+- [x] Executor access path: index equality → lookup(); index BETWEEN → range_lookup()
+- [x] Catalog persists index schemas to catalog.json (backward-compatible)
+- [x] Indexes persist across close/reopen; multiple indexes per table supported
+- [x] Limitation: only INT columns can be indexed (B+Tree keys are uint32)
 
 ### Phase 7 — Multi-table / Joins
 - [ ] Nested-loop join, hash join
