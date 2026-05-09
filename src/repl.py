@@ -227,6 +227,14 @@ def run(dirpath: str) -> None:
     print("Bye.")
 
 
+def main() -> None:
+    """Entry point for the installed `py_btree_engine` console script."""
+    if len(sys.argv) != 2:
+        print("Usage: py_btree_engine <dbdir>", file=sys.stderr)
+        sys.exit(1)
+    run(sys.argv[1])
+
+
 def _execute_and_print(db: Database, sql: str) -> None:
     try:
         rows = db.execute(sql)

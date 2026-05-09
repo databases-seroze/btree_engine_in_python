@@ -1,1 +1,23 @@
+# Python
 **/__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (created inside project root)
+bin/
+include/
+lib/
+lib64
+pyvenv.cfg
+
+# Database files created by the REPL / tests
+*.db
+*.db.wal
+mydb/
+db/
+
+# Test artifacts
+.pytest_cache/
+*.egg-info/
+dist/
+build/
